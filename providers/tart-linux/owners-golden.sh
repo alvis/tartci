@@ -26,14 +26,23 @@
 # checked against pinned SHA-256 values before they enter the VM. The GitHub
 # token is never copied into the VM.
 #
+# Hardening (the last guest step, once key login is proven): sshd refuses password and
+# keyboard-interactive login (a drop-in that sorts before cloud-init's, because sshd keeps
+# the first value it reads). The lanes use the key only; the `admin` password is used by
+# this script alone, until the key is installed. The password is not changed and admin keeps
+# passwordless sudo (jobs need it).
+#
+# The golden is built under a temporary name and renamed into place only when the
+# whole build succeeded, so a failed --rebuild never leaves the pool without a golden.
+#
 # Usage:
 #   providers/tart-linux/owners-golden.sh [--name owners-linux] [--rebuild]
 #     [--base ghcr.io/cirruslabs/ubuntu@sha256:<pin>]
-#     [--ssh-key ~/.ssh/tartci_owners_vm_ed25519] [--disk 40] [--memory 8192]
+#     [--ssh-key ~/.config/tartci/owners-vm-ed25519] [--disk 40] [--memory 8192]
 #     [--cpu 4] [--no-rosetta]
 #
-# Needs on the host: tart, sshpass, ssh, scp, curl, shasum. Builds into
-# $TART_HOME (default ~/.tart), the same store the serving lanes use.
+# Needs on the host: tart, sshpass, ssh, scp, curl, shasum. Builds into $TART_HOME, which
+# defaults to ~/.tart only when unset: `export TART_HOME=~/.tart` first (the pool's store).
 set -euo pipefail
 
 # Ubuntu 24.04 (noble) arm64. Tart accepts name@digest, not name:tag@digest.
@@ -43,7 +52,7 @@ DISK=40; MEMORY=8192; CPU=4; REBUILD=0; ENABLE_ROSETTA=1
 RUNNER_VERSION="2.338.2"
 RUNNER_SHA_ARM64="670adb2f268fe21dcbb58b3db0e0aa9d5b3bddfe2c651481336e561ff86de945"
 RUNNER_SHA_X64="baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40"
-SSH_KEY="${TARTCI_VM_SSH_KEY:-$HOME/.ssh/tartci_owners_vm_ed25519}"
+SSH_KEY="${TARTCI_VM_SSH_KEY:-$HOME/.config/tartci/owners-vm-ed25519}"
 GUEST_USER="admin"; GUEST_PASS="admin"
 DL_DIR="${TARTCI_GOLDEN_DOWNLOADS:-$HOME/.cache/tartci/owners-golden}"
 export TART_HOME="${TART_HOME:-$HOME/.tart}"
@@ -52,7 +61,7 @@ note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
 die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do case "$1" in
-  --name) NAME="$2"; shift 2;;
+  --name) NAME="${2:?--name needs a value}"; shift 2;;
   --base) BASE="$2"; shift 2;;
   --ssh-key) SSH_KEY="$2"; shift 2;;
   --disk) DISK="$2"; shift 2;;
@@ -60,7 +69,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --cpu) CPU="$2"; shift 2;;
   --rebuild) REBUILD=1; shift;;
   --no-rosetta) ENABLE_ROSETTA=0; shift;;
-  -h|--help) sed -n '2,38p' "$0"; exit 0;;
+  -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0;;
   *) die "unknown arg: $1";;
 esac; done
 
@@ -69,12 +78,16 @@ for tool in tart sshpass scp ssh-keygen curl shasum ssh; do
 done
 case "$BASE" in *@sha256:*) ;; *) die "--base must be digest-pinned (@sha256:...) so the golden is reproducible";; esac
 
-if tart list --quiet 2>/dev/null | grep -qx "$NAME"; then
+vm_exists(){ tart list --quiet 2>/dev/null | grep -qxF "$1"; }
+if vm_exists "$NAME"; then
   [ "$REBUILD" = 1 ] || die "$NAME already exists in $TART_HOME (use --rebuild to replace it)"
-  note "deleting existing $NAME (--rebuild)"
-  tart stop "$NAME" >/dev/null 2>&1 || true
-  tart delete "$NAME"
 fi
+# Everything is built under BUILD; $NAME is only touched by the final swap.
+BUILD="${NAME}-build-$$"; OLD="${NAME}-old-$$"
+vm_exists "$BUILD" && die "$BUILD already exists (a leftover of this script? delete it and retry)"
+# A build killed outright (kill -9, power loss) can leave these; never deleted automatically.
+stale="$(tart list --quiet 2>/dev/null | grep -E "^${NAME}-(build|old)-[0-9]+\$" || true)"
+[ -z "$stale" ] || note "leftover VMs of an earlier killed build (check, then tart delete): $(printf "%s" "$stale" | tr "\n" " ")"
 
 # ---- host-side inputs ---------------------------------------------------------
 if [ ! -f "$SSH_KEY" ]; then
@@ -101,35 +114,58 @@ fetch_runner(){ # $1=arm64|x64 $2=sha256
 fetch_runner arm64 "$RUNNER_SHA_ARM64"
 fetch_runner x64 "$RUNNER_SHA_X64"
 
-# ---- clone + size -------------------------------------------------------------
-note "pull base (digest-pinned) and clone → $NAME"
-tart pull "$BASE"
-tart clone "$BASE" "$NAME"
-tart set "$NAME" --disk-size "$DISK" --memory "$MEMORY" --cpu "$CPU"
-
-RPID=""; DONE=0
+# The trap comes first: a failing pull, clone or `tart set` must not leave a partial $BUILD.
+RPID=""; DONE=0; BUILT=0; BOOT_LOG=""
 cleanup(){
-  [ -n "$RPID" ] && { tart stop "$NAME" >/dev/null 2>&1 || true; kill "$RPID" 2>/dev/null || true; }
+  [ -n "$RPID" ] && { tart stop "$BUILD" >/dev/null 2>&1 || true; kill "$RPID" 2>/dev/null || true; }
+  [ -z "$BOOT_LOG" ] || rm -f "$BOOT_LOG"
   if [ "$DONE" != 1 ]; then
-    note "build failed — deleting the partial $NAME"
-    tart delete "$NAME" >/dev/null 2>&1 || true
+    # Interrupted mid-swap: $NAME is gone. Put a golden back under it before deleting anything:
+    # the new build if it finished, else the old golden.
+    if ! vm_exists "$NAME"; then
+      if [ "$BUILT" = 1 ] && vm_exists "$BUILD" && tart rename "$BUILD" "$NAME"; then
+        note "interrupted mid-swap; the completed new build is now $NAME$(vm_exists "$OLD" && echo " (the previous one is kept as $OLD; delete it when happy)")"
+        DONE=1
+      elif vm_exists "$OLD" && tart rename "$OLD" "$NAME"; then
+        note "interrupted mid-swap; the previous $NAME was restored"
+      elif vm_exists "$OLD"; then
+        note "WARNING: no VM is named $NAME; the previous golden is $OLD (tart rename $OLD $NAME)"
+      fi
+    fi
+    if [ "$DONE" != 1 ]; then
+      if [ "$BUILT" = 1 ] && ! vm_exists "$BUILD" && vm_exists "$NAME"; then
+        # Interrupted right after the second rename: the new golden is already in place.
+        note "interrupted after the swap; the new $NAME is in place$(vm_exists "$OLD" && echo " (delete the previous one, $OLD, when happy)")"
+      elif vm_exists "$NAME" || ! vm_exists "$OLD"; then
+        note "build failed — deleting the partial $BUILD"
+        tart delete "$BUILD" >/dev/null 2>&1 || true
+      else
+        note "keeping $BUILD: no VM is named $NAME"
+      fi
+    fi
   fi
 }
 trap cleanup EXIT
 
+# ---- clone + size -------------------------------------------------------------
+note "pull base (digest-pinned) and clone → $BUILD"
+tart pull "$BASE"
+tart clone "$BASE" "$BUILD"
+tart set "$BUILD" --disk-size "$DISK" --memory "$MEMORY" --cpu "$CPU"
+
 RUN_ARGS=(--no-graphics)
 [ "$ENABLE_ROSETTA" = 1 ] && RUN_ARGS+=(--rosetta=rosetta)
-note "boot $NAME (rosetta share: $([ "$ENABLE_ROSETTA" = 1 ] && echo on || echo off))"
+note "boot $BUILD (rosetta share: $([ "$ENABLE_ROSETTA" = 1 ] && echo on || echo off))"
 BOOT_LOG="$(mktemp -t owners-golden-boot)"
-tart run ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} "$NAME" >"$BOOT_LOG" 2>&1 & RPID=$!
+tart run ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} "$BUILD" >"$BOOT_LOG" 2>&1 & RPID=$!
 
 IP=""
 for _ in $(seq 1 60); do
-  IP="$(tart ip "$NAME" 2>/dev/null || true)"; [ -n "$IP" ] && break
+  IP="$(tart ip "$BUILD" 2>/dev/null || true)"; [ -n "$IP" ] && break
   kill -0 "$RPID" 2>/dev/null || { tail -5 "$BOOT_LOG" >&2; die "tart run exited early (see above)"; }
   sleep 2
 done
-[ -n "$IP" ] || { tail -5 "$BOOT_LOG" >&2; die "no IP for $NAME after 120s"; }
+[ -n "$IP" ] || { tail -5 "$BOOT_LOG" >&2; die "no IP for $BUILD after 120s"; }
 
 SSH_COMMON=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10)
 gpass(){ SSHPASS="$GUEST_PASS" sshpass -e "$@"; }
@@ -149,6 +185,16 @@ done
 # ssh-stdin: an argv prefix; every use below passes -n or feeds a heredoc to `bash -s`
 KSSH=(ssh -o BatchMode=yes -i "$SSH_KEY" ${SSH_COMMON[@]+"${SSH_COMMON[@]}"})
 ${KSSH[@]+"${KSSH[@]}"} -n "$GUEST_USER@$IP" true || die "key SSH to the guest failed"
+# `tart ip` can briefly answer with another VM's stale lease; every later step goes to $IP, so
+# re-check that it is still $BUILD's at each stage, and stop rather than provision the wrong VM.
+same_vm(){
+  local now="" n=0
+  while [ -z "$now" ] && [ "$n" -lt 3 ]; do  # retry a transient empty answer; a DIFFERENT IP is fatal at once
+    now="$(tart ip "$BUILD" 2>/dev/null || true)"; [ -n "$now" ] || sleep 2; n=$((n + 1))
+  done
+  [ "$now" = "$IP" ] || die "tart ip $BUILD changed from $IP to ${now:-nothing} ($1); refusing to continue"
+}
+same_vm "after the key install"
 
 note "copy the runner archives (sha256-verified on the host)"
 scp -q -o BatchMode=yes -i "$SSH_KEY" ${SSH_COMMON[@]+"${SSH_COMMON[@]}"} \
@@ -266,11 +312,62 @@ sudo rm -f /var/lib/dhcp/*.leases 2>/dev/null || true
 sync
 GUEST
 
-note "shut down and keep $NAME"
+# ---- hardening: the LAST guest step. The password was needed only to install the key. -----
+# The lanes connect with BatchMode + the pool key. Without this, a job that knows the image's
+# `admin`/`admin` could log in to any pool VM it can reach (they share Tart's default NAT
+# network). cloud-init's 50-cloud-init.conf sets `PasswordAuthentication yes` and sshd keeps the
+# FIRST value it reads, so the drop-in must sort before it: 00-*.
+same_vm "after provisioning"
+note "hardening: key-only sshd"
+${KSSH[@]+"${KSSH[@]}"} "$GUEST_USER@$IP" 'bash -s' <<'HARDEN'
+set -euo pipefail
+sudo -n true
+sudo tee /etc/ssh/sshd_config.d/00-tartci-key-only.conf >/dev/null <<'CONF'
+# tartci owner pool: the serving lanes log in by key only. First match wins, so this sorts before 50-cloud-init.conf.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+CONF
+sudo chmod 644 /etc/ssh/sshd_config.d/00-tartci-key-only.conf
+sudo sshd -t
+effective="$(sudo sshd -T -C user=admin,host=pool,addr=192.168.64.2)"  # with Match blocks applied
+for want in 'passwordauthentication no' 'kbdinteractiveauthentication no' 'authenticationmethods publickey'; do
+  printf '%s\n' "$effective" | grep -qix "$want" || { echo "sshd does not honour: $want" >&2; exit 1; }
+done
+sudo systemctl restart ssh.service
+sync  # a guest write only a hard stop could lose (a bare `tart stop` did, on Linux)
+echo "TARTCI_HARDENED sshd=publickey-only"
+HARDEN
+same_vm "after hardening"
+note "proving: key login works, password login is refused"
+for _ in $(seq 1 20); do ${KSSH[@]+"${KSSH[@]}"} -n "$GUEST_USER@$IP" true 2>/dev/null && break; sleep 2; done
+${KSSH[@]+"${KSSH[@]}"} -n "$GUEST_USER@$IP" true || die "key login broke after hardening"
+if gpass ssh -n ${SSH_COMMON[@]+"${SSH_COMMON[@]}"} -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no \
+    -o NumberOfPasswordPrompts=1 "$GUEST_USER@$IP" true 2>/dev/null; then
+  die "password login still works after hardening"
+fi
+
+note "shut down $BUILD"
 ${KSSH[@]+"${KSSH[@]}"} -n "$GUEST_USER@$IP" 'sudo systemctl poweroff' >/dev/null 2>&1 || true
 for _ in $(seq 1 30); do kill -0 "$RPID" 2>/dev/null || break; sleep 2; done
-tart stop "$NAME" >/dev/null 2>&1 || true
-RPID=""
-DONE=1
-rm -f "$BOOT_LOG"
+tart stop "$BUILD" >/dev/null 2>&1 || true
+RPID=""; BUILT=1
+rm -f "$BOOT_LOG"; BOOT_LOG=""
+
+# ---- swap in: $NAME is replaced only now, after a complete build ---------------------------
+if vm_exists "$NAME"; then
+  note "replacing $NAME (the old one is kept as $OLD until the new one is in place)"
+  tart rename "$NAME" "$OLD"
+  if ! tart rename "$BUILD" "$NAME"; then
+    if tart rename "$OLD" "$NAME"; then
+      die "could not move $BUILD to $NAME; the previous $NAME was restored"
+    fi
+    die "could not move $BUILD to $NAME, nor restore $OLD; run: tart rename $OLD $NAME"
+  fi
+  DONE=1
+  tart delete "$OLD" || note "could not delete $OLD; delete it by hand"
+else
+  tart rename "$BUILD" "$NAME"
+  DONE=1
+fi
 note "built $NAME ($(tart list | awk -v n="$NAME" '$2==n {print $3 " GB disk, " $5 " GB on host"}'))"
