@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the tartci owner-pool dispatcher (docs/owner-pool.md).
+
+  Do not render this by hand: `tartci owners install` renders it, exports the
+  reviewed commit it runs, and loads it (scripts/owners_service.py). It fills
+  in:
+
+    $HOME        the user's home directory
+    $APP         ~/.tartci/owners/app/<full commit sha>: the pinned export
+    $CONFIG      absolute path of the owners.toml the pool serves
+    $ROOT        the pool root (state, logs, cache): ~/.tartci/owners
+    $PATHDIRS    absolute directories of tart and gh (the system dirs follow)
+    $PYTHON      absolute path of the Python 3.11+ (tomllib) that runs the dispatcher
+
+  Why each key is what it is:
+
+  * ProgramArguments starts at /usr/bin/caffeinate, an Apple binary, so the
+    launchd identity lint treats the job as a stable platform program.
+    `caffeinate -i CMD` execs CMD under the SAME pid (a helper process holds
+    the PreventUserIdleSystemSleep assertion and dies with CMD), so launchd's
+    SIGTERM reaches the dispatcher directly and its shutdown (SIGTERM the
+    children, wait for them to delete their VMs, SIGKILL the group) runs.
+    The Mac cannot idle-sleep mid-job; the display may still sleep.
+  * The script path is the full-sha export, never a `current` link: a flipped
+    link under a running dispatcher would let it spawn children from another
+    commit. Updating is `tartci owners install --rev REV`, which re-renders this.
+  * KeepAlive true: the dispatcher never exits 0 on its own. It exits 75 on
+    purpose (GitHub unreachable for ~3 minutes, no children left) so launchd
+    restarts it with fresh credentials, and it exits 128+N after a signal.
+    Intentional stops go through `bootout` (uninstall), which removes the job,
+    so there is no stop that KeepAlive would fight. ThrottleInterval bounds a
+    crash loop (a config that stopped parsing exits 2 every start).
+  * ExitTimeOut (210 s; a unit test keeps it above CHILD_TERM_GRACE_SECONDS
+    + 30) is the dispatcher's child grace (150 s) plus the time a scan already
+    in flight can take to return and the final kill pass. launchd SIGKILLs the
+    dispatcher when it expires. MEASURED on macOS 27: launchd caps this key at
+    60 s for a user agent (`launchctl print` reports 60 and a SIGTERM-ignoring
+    job that asked for 210 was SIGKILLed after 61 s), so the dispatcher can die
+    before its 150 s grace is over. That is safe: it sends SIGTERM to every
+    child first, children are in their own sessions and finish deleting their
+    VMs on their own, and the next dispatcher's startup reap (or `uninstall`,
+    which waits up to 150 s for them) deals with any straggler.
+  * The dispatcher starts every child with the macOS "responsible process"
+    disclaimed (owners_dispatch.spawn_disclaimed). Without that, launchd's job
+    main process is Homebrew's Python.app (a bundled app executable), Local
+    Network privacy applies to everything it spawns, and `ssh` to a Tart VM
+    fails with "No route to host" (docs/gotchas.md, 2026-11-22).
+  * ProcessType Standard: Background would throttle the VMs the children boot.
+  * The process group is NOT abandoned: when the dispatcher dies, launchd
+    removes its helper. Children run in their own sessions (start_new_session)
+    and are adopted by the next dispatcher.
+  * No credentials here. The dispatcher and its children authenticate with the
+    user's `gh` keyring login; GH_TOKEN and GITHUB_TOKEN are never forwarded.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.tartci.owners</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>/bin/bash</string>
+        <string>$APP/tartci</string>
+        <string>owners</string>
+        <string>--config</string>
+        <string>$CONFIG</string>
+        <string>--root</string>
+        <string>$ROOT</string>
+        <string>run</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ExitTimeOut</key>
+    <integer>210</integer>
+
+    <key>ProcessType</key>
+    <string>Standard</string>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/tartci/owners.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/tartci/owners.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>$PATHDIRS:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TARTCI_PYTHON</key>
+        <string>$PYTHON</string>
+        <key>TART_HOME</key>
+        <string>$HOME/.tart</string>
+        <key>TARTCI_VM_SSH_KEY</key>
+        <string>$HOME/.config/tartci/owners-vm-ed25519</string>
+    </dict>
+</dict>
+</plist>

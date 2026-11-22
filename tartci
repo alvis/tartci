@@ -69,7 +69,7 @@
 #   tartci goldens doctor [--receipt FILE] [--promotion]                     # read-only receipt/freshness check
 #   tartci prepare <os>        # run the provider's image-preparation command; see docs/prepare.md
 #   tartci up <os>             # one on-demand build+ctest in a throwaway clone, then discard
-#   tartci owners <run|dry-run|status> # serve queued jobs of the private repos of configured owners
+#   tartci owners <run|dry-run|status|install|uninstall> # serve queued jobs of the private repos of configured owners; install = pinned LaunchAgent
 #   tartci serve <os> [--loop] # serve the GitHub Actions pool: ephemeral per-job runner(s)
 #   tartci launchd <reload <label>|status|heal>  # heal a wedged serve LaunchAgent (full bootout+bootstrap)
 #                              # reload refuses a mid-job lane (exit 3) unless --force;
