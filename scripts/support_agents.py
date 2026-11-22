@@ -339,6 +339,9 @@ OTHER_OWNERS: Dict[str, str] = {
     # delete").
     "com.danielraffel.tartci.runner-host-health": "docs/runbook.md (persistent runner, its own host)",
     "com.danielraffel.tartci.persistent-runner-heal": "docs/runbook.md (persistent runners, one fleet host)",
+    # The owner-wide pool pins its own exported commit and is installed by its
+    # own command (docs/owner-pool.md), never by a fleet profile.
+    "com.danielraffel.tartci.owners": "tartci owners install (scripts/owners_service.py)",
 }
 
 

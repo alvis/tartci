@@ -29,6 +29,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from typing import Any
 
 import debug_hold  # sibling module; owns the held- prefix
@@ -423,8 +424,9 @@ def github_runner_census(
     repo: str,
     timeout: float = 15.0,
     budget: ObservationBudget | None = None,
+    scopes: Sequence[str] | None = None,
 ) -> runner_census.RunnerCensus:
-    """Read every registration scope that can serve `repo`.
+    """Read every registration scope that can serve `repo` (or just `scopes`).
 
     A repository-only listing omits organization-registered runners, so the
     janitor would classify a registration it cannot see as absent. Both scopes
@@ -439,6 +441,8 @@ def github_runner_census(
         )
 
     fetch = runner_census.cli_fetcher(github_cli(), run_json=run_json)
+    if scopes:
+        return runner_census.collect(repo, fetch, scopes=tuple(scopes))
     return runner_census.collect(repo, fetch)
 
 
@@ -447,8 +451,9 @@ def github_runners(
     timeout: float = 15.0,
     budget: ObservationBudget | None = None,
     problems: list[str] | None = None,
+    scopes: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Runner rows from every scope, each carrying the endpoint that owns it.
+    """Runner rows from every scope (or just `scopes`), each carrying the endpoint that owns it.
 
     Deletion and inspection must address a registration through its own scope,
     so every row keeps `_endpoint`. A scope that could not be read is reported
@@ -456,7 +461,7 @@ def github_runners(
     census where no scope could be read is an observation failure, not an empty
     fleet.
     """
-    census = github_runner_census(repo, timeout, budget)
+    census = github_runner_census(repo, timeout, budget, scopes)
     if census.unreachable and len(census.unreachable) == len(census.scopes):
         raise ObservationError("github_runners", "unreadable", census.unreachable_detail())
     if problems is not None:
@@ -904,11 +909,21 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     offline_seen: dict[str, dict[str, Any]] = {}
     tart_providers = {"", "tart-macos", "tart-linux"}
 
-    for tool in ("tart", github_cli()):
+    # --runners-only: GitHub registrations only. No Tart VM is listed, stopped or deleted,
+    # and no state file is read or removed: a caller that owns VM cleanup itself (the owner
+    # pool's dispatcher) asks the janitor for the registration half and nothing else.
+    runners_only = bool(getattr(args, "runners_only", False))
+    # --scopes: read (and so delete) registrations of these scopes only; empty = every scope.
+    reap_scopes = [item for item in str(getattr(args, "scopes", "") or "").split(",") if item.strip()]
+    reap_scopes = [item.strip() for item in reap_scopes]
+    for tool in ((github_cli(),) if runners_only else ("tart", github_cli())):
         if shutil.which(tool) is None:
             unreadable.append(f"missing_tool:{tool}")
 
-    states, state_problems = load_states(state_dirs, now)
+    if runners_only:
+        states, state_problems = [], []
+    else:
+        states, state_problems = load_states(state_dirs, now)
     problems.extend(state_problems)
     states_by_vm = {
         str(state.get("vm") or ""): state
@@ -924,7 +939,7 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     runners: list[dict[str, Any]] = []
     capacity = {"macos_cap": args.macos_cap, "running_macos_vms": None, "free": None}
 
-    if not unreadable:
+    if not unreadable and not runners_only:
         try:
             raw_vms = tart_vms(args.tart_timeout_secs, observation_budget)
             running_macos = macos_running_count(
@@ -1163,6 +1178,7 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 args.github_timeout_secs,
                 observation_budget,
                 problems,
+                **({"scopes": reap_scopes} if reap_scopes else {}),
             )
         except ObservationError as exc:
             unreadable.append(exc.problem_code)
@@ -1300,6 +1316,8 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "min_offline_passes": args.min_offline_passes,
             "protected_names": protected,
             "fix": args.fix,
+            "runners_only": runners_only,
+            "scopes": reap_scopes or list(runner_census.SCOPES),
             "stopped_age_secs": args.stopped_age_secs,
             "orphan_age_secs": args.orphan_age_secs,
             "running_age_secs": args.running_age_secs,
@@ -1397,6 +1415,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="change nothing (overrides --fix); print the VMs a fix would delete")
     parser.add_argument("--repo", default=os.environ.get("TARTCI_RUNNER_REPO", "Generous-Corp/pulp"))
     parser.add_argument(
+        "--runners-only", action="store_true",
+        help="act on GitHub runner registrations only: touch no Tart VM and no state file")
+    parser.add_argument(
+        "--scopes", default="",
+        help="comma-separated registration scopes to read and delete (repository, organization); "
+             "default: both. The owner pool passes `repository`: it only ever registers there")
+    parser.add_argument(
         "--state-dir",
         default=os.environ.get("TARTCI_STATE_DIR"),
         help="explicit state dir(s), comma or os.pathsep separated; overrides --state-root",
@@ -1450,7 +1475,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--tart-timeout-secs", type=float, default=float(os.environ.get("TARTCI_TART_TIMEOUT_SECS", "15")))
     parser.add_argument("--github-timeout-secs", type=float, default=float(os.environ.get("TARTCI_GH_TIMEOUT_SECS", "15")))
     parser.add_argument("--observation-timeout-secs", type=float, default=float(os.environ.get("TARTCI_OBSERVATION_TIMEOUT_SECS", "60")))
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    bad = [item.strip() for item in args.scopes.split(",")
+           if item.strip() and item.strip() not in runner_census.SCOPES]
+    if bad:
+        parser.error(f"--scopes: unknown scope {bad[0]!r} (choose from {', '.join(runner_census.SCOPES)})")
+    return args
 
 
 def ensure_tart_home() -> dict[str, Any]:

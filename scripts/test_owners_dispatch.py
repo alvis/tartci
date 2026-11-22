@@ -584,6 +584,7 @@ class SchedulerHarness(unittest.TestCase):
         self.now = 1000.0
         self.open = True
         self.spawned: List[Any] = []
+        self.spawn_err_paths: List[Optional[str]] = []
         # No test may signal a real pid or group: record instead.
         self.sent: List[Tuple[int, Any]] = []
         self._patches = [mock.patch.object(od, "_signal", lambda proc, sig: self.sent.append((proc.pid, sig))),
@@ -593,9 +594,10 @@ class SchedulerHarness(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def spawn(self, argv: List[str], env: Dict[str, str], log_path: str) -> FakeProc:
+    def spawn(self, argv: List[str], env: Dict[str, str], log_path: str, err_path: Optional[str] = None) -> FakeProc:
         proc = FakeProc()
         self.spawned.append((argv, env, log_path, proc))
+        self.spawn_err_paths.append(err_path)
         return proc
 
     def sched(self, base_env: Optional[Dict[str, str]] = None, **cfg: Any) -> od.Scheduler:
@@ -795,6 +797,22 @@ class RefusalTests(SchedulerHarness):
         self.assertEqual(os.listdir(os.path.join(self.root, "state")), [])
         sched.note_start_failure("o/r", "linux-a64")
         self.assertEqual(sched.plan([self.job(1, "linux-a64")], self.now), [])
+
+    def test_a_child_spawn_failure_is_recorded_as_child_until_a_child_starts(self) -> None:
+        sched = self.sched()
+        real = sched.spawn
+
+        def boom(argv: List[str], env: Dict[str, str], log_path: str) -> Any:
+            raise OSError(errno.ENOENT, "No such file or directory")
+
+        with mock.patch.dict(od.LAST_SPAWN_ERROR, clear=True):
+            sched.spawn = boom
+            with self.assertRaises(OSError):
+                sched.start("o/r", "linux-a64")
+            self.assertIn("No such file", od.LAST_SPAWN_ERROR["child"]["error"])
+            sched.spawn = real
+            sched.start("o/r", "linux-a64")
+            self.assertEqual(od.LAST_SPAWN_ERROR, {})
 
     def test_vm_state_marks_the_child_as_booted(self) -> None:
         sched = self.sched()

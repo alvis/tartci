@@ -4,7 +4,9 @@ owners on one host (see docs/owner-pool.md).
 
     tartci owners run       the dispatcher: scan, start `tartci serve --once` children
     tartci owners dry-run   print what would be served, start nothing, mint nothing
-    tartci owners status    repositories, children, rate headroom, commit
+    tartci owners status    repositories, children, rate headroom, commit, service
+    tartci owners install   export a commit and load the LaunchAgent that runs `run` (scripts/owners_service.py)
+    tartci owners uninstall unload and remove it; keep goldens and config
 
 The dispatcher decides *which repository and lane needs a runner next*. Everything
 after that is tartci: lease admission, JIT registration, a throwaway VM, one job.
@@ -12,16 +14,17 @@ GitHub assigns jobs by label; this never assigns or cancels one.
 
 Seams left for later changes: `Directory.refresh` / `Scanner.scan_repo` are the only
 GitHub readers, so a push receiver can mark repositories for an immediate scan by
-calling `Dispatcher.request_scan(repo)`; `install`/`uninstall` only need `main`'s
-subcommand table.
+calling `Dispatcher.request_scan(repo)`.
 """
 from __future__ import annotations
 
 import argparse
 import collections
 import concurrent.futures
+import ctypes
 import dataclasses
 import datetime as dt
+import errno
 import glob
 import json
 import os
@@ -34,6 +37,8 @@ import sys
 import threading
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import python_child
 
 # --------------------------------------------------------------------------- lanes
 
@@ -1284,7 +1289,12 @@ class Scheduler:
                                     "token": secrets.token_hex(12), "spawned_at": now,
                                     "dispatcher_pid": os.getpid(), "log": log_path}
             write_private_json(os.path.join(state_dir, CHILD_META), meta)
-            proc = self.spawn(child_argv(self.tartci, self.cfg, lane, repo), env, log_path)
+            try:
+                proc = self.spawn(child_argv(self.tartci, self.cfg, lane, repo), env, log_path)
+            except OSError as exc:
+                record_spawn("child", exc)
+                raise
+            record_spawn("child")
             meta["pid"] = getattr(proc, "pid", 0)
             # Record the pid at once, so a crash before the start time is known leaves a
             # live child the reaper keeps (it never deletes a dir whose pid is alive).
@@ -1514,13 +1524,174 @@ def _kill_group(proc: Any, sig: int) -> None:
     _signal(proc, sig)
 
 
-def spawn_process(argv: List[str], env: Dict[str, str], log_path: str) -> Any:
-    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)  # born 0600
+class SpawnedProcess:
+    """The part of `subprocess.Popen` the scheduler uses (pid, pgid, poll, wait, returncode) for a
+    child made by posix_spawn."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.pgid = pid  # POSIX_SPAWN_SETSID: it leads its own session and group
+        self.returncode: Optional[int] = None
+
+    def poll(self) -> Optional[int]:
+        if self.returncode is None:
+            try:
+                done, status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                self.returncode = 0  # someone else reaped it (Popen reports 0 as well)
+            else:
+                if done:
+                    self.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(str(self.pid), timeout)  # type: ignore[arg-type]
+            time.sleep(0.05)
+        return int(self.returncode or 0)
+
+
+# Apple's <spawn.h> flags (the numeric values are part of the macOS ABI).
+_SPAWN_SETSIGDEF, _SPAWN_SETSIGMASK, _SPAWN_SETSID, _SPAWN_CLOEXEC_DEFAULT = 0x04, 0x08, 0x0400, 0x4000
+
+
+_SPAWN_LIBC: List[Optional[Any]] = []  # loaded once: the dispatcher asks on every spawn and snapshot
+
+# The last spawn that raised, per kind ("child", "reap"): {"at": epoch seconds, "error": text},
+# cleared only by the next success of the SAME kind, so a reap pass that spawns fine every 90 s
+# never hides children that cannot start. `spawn_mode()` says which path is in use; this says
+# whether it is working.
+LAST_SPAWN_ERROR: Dict[str, Dict[str, Any]] = {}
+
+
+def record_spawn(kind: str, error: Optional[BaseException] = None) -> None:
+    """Note how the latest spawn of `kind` went (None: it worked)."""
+    if error is None:
+        LAST_SPAWN_ERROR.pop(kind, None)
+    else:
+        LAST_SPAWN_ERROR[kind] = {"at": time.time(), "error": str(error)}
+
+
+def _spawn_libc() -> Optional[Any]:
+    """libSystem with the symbols `spawn_disclaimed` needs, or None (not macOS, or one is missing)."""
+    if not _SPAWN_LIBC:
+        _SPAWN_LIBC.append(_load_spawn_libc())
+    return _SPAWN_LIBC[0]
+
+
+def _load_spawn_libc() -> Optional[Any]:
+    if sys.platform != "darwin":
+        return None
     try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        for name in ("responsibility_spawnattrs_setdisclaim", "posix_spawn", "posix_spawnattr_init",
+                     "posix_spawn_file_actions_init", "posix_spawn_file_actions_adddup2",
+                     "posix_spawn_file_actions_addopen", "posix_spawnattr_setsigdefault",
+                     "posix_spawnattr_setsigmask", "sigemptyset", "sigaddset"):
+            getattr(libc, name)
+    except (OSError, AttributeError):
+        return None
+    return libc
+
+
+def _spawn_check(code: int, what: str) -> None:
+    """Raise OSError unless a libc call succeeded. `posix_spawn*` return the error number itself;
+    `sigemptyset` and `sigaddset` return -1 and set errno."""
+    if code == 0:
+        return
+    number = code if code > 0 else (ctypes.get_errno() or errno.EINVAL)
+    raise OSError(number, f"{what} failed: {os.strerror(number)}")
+
+
+def spawn_mode() -> str:
+    """Which spawn path this process uses: said once at startup and shown by `tartci owners status`,
+    so a fallback to plain Popen (children NOT disclaimed, ssh to a VM can fail with "No route to
+    host" under launchd) is never silent."""
+    if _spawn_libc() is not None:
+        return "disclaimed posix_spawn"
+    return "Popen fallback (responsibility NOT disclaimed)"
+
+
+def spawn_disclaimed(libc: Any, argv: List[str], env: Dict[str, str], fd: int,
+                     err_fd: Optional[int] = None) -> SpawnedProcess:
+    """posix_spawn `argv` in its own session with stdin /dev/null, stdout on `fd` and stderr on
+    `err_fd` (default: `fd`, so both share one log), and with the macOS "responsible process"
+    DISCLAIMED. Every libc call is checked: a failed disclaim raises OSError rather than silently
+    starting a child that is not disclaimed.
+
+    Why: macOS attributes a process's network access to its responsible process. Under launchd that
+    is the job's main process, and when that is a bundled app executable (Homebrew's Python re-execs
+    into Python.app) Local Network privacy applies to it and to everything it spawns: `ssh` to a
+    Tart VM then fails with "No route to host" and no prompt can ever be answered. A disclaimed child
+    is its own responsible process (bash, ssh, tart are platform tools and are allowed), which is
+    what an interactive run gets from the terminal. Measured live on macOS 27: the same `ssh` from a
+    launchd job, spawned plainly by Python.app: rc 255 "No route to host"; spawned with this: rc 0."""
+    program = argv[0]
+    if os.sep not in program:
+        found = shutil.which(program, path=env.get("PATH") or os.defpath)
+        if not found:
+            raise FileNotFoundError(2, os.strerror(2), program)
+        program = found
+    attr, actions, sigdef, sigmask = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_uint32(), ctypes.c_uint32()
+    pid = ctypes.c_int()
+    _spawn_check(libc.posix_spawnattr_init(ctypes.byref(attr)), "posix_spawnattr_init")
+    try:
+        _spawn_check(libc.posix_spawn_file_actions_init(ctypes.byref(actions)), "posix_spawn_file_actions_init")
+        try:
+            _spawn_check(libc.responsibility_spawnattrs_setdisclaim(ctypes.byref(attr), 1),
+                         "responsibility_spawnattrs_setdisclaim")
+            _spawn_check(libc.sigemptyset(ctypes.byref(sigdef)), "sigemptyset")
+            # What Popen(restore_signals=True) restores: Python ignores these, a child must not inherit that.
+            for name in ("SIGPIPE", "SIGXFSZ"):
+                if hasattr(signal, name):
+                    _spawn_check(libc.sigaddset(ctypes.byref(sigdef), getattr(signal, name)), f"sigaddset({name})")
+            _spawn_check(libc.sigemptyset(ctypes.byref(sigmask)), "sigemptyset")
+            _spawn_check(libc.posix_spawnattr_setsigdefault(ctypes.byref(attr), ctypes.byref(sigdef)),
+                         "posix_spawnattr_setsigdefault")
+            _spawn_check(libc.posix_spawnattr_setsigmask(ctypes.byref(attr), ctypes.byref(sigmask)),
+                         "posix_spawnattr_setsigmask")
+            _spawn_check(libc.posix_spawnattr_setflags(ctypes.byref(attr), ctypes.c_short(
+                _SPAWN_SETSIGDEF | _SPAWN_SETSIGMASK | _SPAWN_SETSID | _SPAWN_CLOEXEC_DEFAULT)),
+                "posix_spawnattr_setflags")
+            _spawn_check(libc.posix_spawn_file_actions_addopen(
+                ctypes.byref(actions), 0, os.fsencode(os.devnull), os.O_RDONLY, 0), "file_actions_addopen(stdin)")
+            _spawn_check(libc.posix_spawn_file_actions_adddup2(ctypes.byref(actions), fd, 1),
+                         "file_actions_adddup2(stdout)")
+            _spawn_check(libc.posix_spawn_file_actions_adddup2(ctypes.byref(actions), fd if err_fd is None else err_fd, 2),
+                         "file_actions_adddup2(stderr)")
+            c_argv = (ctypes.c_char_p * (len(argv) + 1))(*[os.fsencode(a) for a in argv], None)
+            entries = [os.fsencode(f"{key}={value}") for key, value in env.items()]
+            c_env = (ctypes.c_char_p * (len(entries) + 1))(*entries, None)
+            code = libc.posix_spawn(ctypes.byref(pid), os.fsencode(program), ctypes.byref(actions),
+                                    ctypes.byref(attr), c_argv, c_env)
+        finally:
+            libc.posix_spawn_file_actions_destroy(ctypes.byref(actions))
+    finally:
+        libc.posix_spawnattr_destroy(ctypes.byref(attr))
+    if code != 0:
+        raise OSError(code, os.strerror(code), program)
+    return SpawnedProcess(pid.value)
+
+
+def spawn_process(argv: List[str], env: Dict[str, str], log_path: str, err_path: Optional[str] = None) -> Any:
+    """Start `argv` detached (own session, stdin /dev/null). stdout and stderr go to `log_path`
+    (0600, appended), or stderr to `err_path` when given."""
+    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)  # born 0600
+    err_fd: Optional[int] = None
+    try:
+        if err_path:
+            err_fd = os.open(err_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        libc = _spawn_libc()
+        if libc is not None:
+            return spawn_disclaimed(libc, argv, env, fd, err_fd)
         return subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=fd,
-                                stderr=subprocess.STDOUT, start_new_session=True)
+                                stderr=subprocess.STDOUT if err_fd is None else err_fd, start_new_session=True)
     finally:
         os.close(fd)
+        if err_fd is not None:
+            os.close(err_fd)
 
 
 # ----------------------------------------------------------- leftover reaping at start
@@ -1687,10 +1858,210 @@ def tart_runner(argv: List[str]) -> str:
     return proc.stdout
 
 
+# ------------------------------------------------- periodic runner-registration reap
+
+# The runner names the pool's own children register under: a macOS child's VM and runner are
+# `tartci-owners-<lane><n>-<pid>-<k>`, a Linux child's are `linux-ephr-<pid>-<k>`.
+REAP_PREFIXES = "tartci-owners-,linux-ephr-"
+REAP_EVERY_SECONDS = 90.0  # one repository per pass: 94 repositories are all visited in ~2.4 h
+REAP_FIRST_DELAY_SECONDS = 30.0  # after startup, so adoption and the first scans come first
+REAP_TIMEOUT_SECONDS = 180.0  # a pass that runs longer is killed (vm_reap bounds itself to ~60 s)
+REAP_SCOPES = "repository"  # the only scope the pool registers runners at (never organization)
+REAP_MIN_OFFLINE_SECONDS = 900  # vm_reap's own defaults, passed explicitly so no environment moves them
+REAP_MIN_OFFLINE_PASSES = 3
+REAP_MIN_HEADROOM = RATE_WIDEN_BELOW  # no pass while the shared API allowance is below this share
+
+
+class ReapPass:
+    """The slow, round-robin cleaner of runner registrations the pool left on GitHub.
+
+    A crashed child leaves its JIT registration behind, offline. tartci's own reaper
+    (scripts/vm_reap.py) knows how to delete those safely, but only per repository, and only
+    after a registration was seen offline on 3 passes spanning 900 s. This runs it for ONE
+    served repository at a time as a child process, every REAP_EVERY_SECONDS, in the
+    registrations-only mode (`--runners-only`): it lists and deletes no VM and reads no state
+    file, because `reap_leftovers` owns the pool's VM cleanup. It reads and deletes
+    repository-scope registrations only (`--scopes repository`): the pool registers through
+    `repos/<R>/actions/runners/generate-jitconfig` and never at organization scope, so an
+    organization's runners are never listed (and `users/<owner>` is never probed). Safety rests on vm_reap:
+    a registration is deleted only when it is `offline` and not `busy`, its name has the
+    per-boot shape `<name>-<pid>-<n>` and starts with REAP_PREFIXES, it carries no other
+    host's `pulp-host-*` label, and it was seen offline on 3 passes over 900 s. Each
+    repository has its own offline clock under `<root>/reap/<owner>__<repo>/`, because
+    vm_reap rewrites that file on every pass and a shared one would reset another
+    repository's count. A repository with a live child of ours is skipped (its registration
+    is momentarily offline between minting and connecting)."""
+
+    def __init__(self, cfg: Config, root: str, tartci_root: str, *,
+                 spawn: Callable[..., Any] = spawn_process,
+                 clock: Callable[[], float] = time.time,
+                 interval: float = REAP_EVERY_SECONDS, first_delay: float = REAP_FIRST_DELAY_SECONDS,
+                 timeout: float = REAP_TIMEOUT_SECONDS,
+                 base_env: Optional[Dict[str, str]] = None, home: str = os.path.expanduser("~"),
+                 python: Optional[str] = None) -> None:
+        self.cfg, self.root, self.tartci_root = cfg, root, tartci_root
+        self.spawn, self.clock = spawn, clock
+        self.interval, self.timeout = interval, timeout
+        self.base_env = dict(os.environ if base_env is None else base_env)
+        self.home = home
+        self.python = python or python_child.child_python()
+        self.next_at = clock() + first_delay
+        self.cursor = ""  # the repository reaped last; the next pass takes the one after it
+        self.proc: Any = None
+        self.repo = ""
+        self.started_at = 0.0
+        self.out_path = ""
+        self.err_path = ""
+        self.passes = 0
+        self.fixed_total = 0
+        self.last_repo = ""
+        self.last_at = 0.0
+        self.last_rc: Optional[int] = None
+
+    @property
+    def running(self) -> bool:
+        return self.proc is not None
+
+    # -- what one pass runs
+    def state_root(self, repo: str) -> str:
+        return os.path.join(self.root, "reap", repo.replace("/", "__"))
+
+    def argv(self, repo: str) -> List[str]:
+        return [self.python, os.path.join(self.tartci_root, "scripts", "vm_reap.py"),
+                "--runners-only", "--scopes", REAP_SCOPES, "--fix", "--json", "--repo", repo,
+                "--state-root", self.state_root(repo),
+                "--prefixes", REAP_PREFIXES, "--own-name-prefixes", REAP_PREFIXES,
+                "--min-offline-secs", str(REAP_MIN_OFFLINE_SECONDS),
+                "--min-offline-passes", str(REAP_MIN_OFFLINE_PASSES)]
+
+    def env(self) -> Dict[str, str]:
+        env = gh_env(self.base_env)  # the children's environment: keyring login, no tokens
+        env.update({"TARTCI_GH_CLI": self.cfg.gh_cli,
+                    "TARTCI_REAP_OWN_NAME_PREFIXES": REAP_PREFIXES,
+                    "TART_HOME": os.path.join(self.home, ".tart")})
+        return env
+
+    # -- scheduling
+    def pick(self, served: Iterable[str], busy: Iterable[str]) -> Optional[str]:
+        """The next repository in sorted round-robin order after the last one reaped,
+        skipping those with a live child. None when there is none to reap."""
+        busy_set = {name.lower() for name in busy}
+        ring = sorted(name for name in set(served) if REPO_RE.match(name))
+        if not ring:
+            return None
+        start = next((i for i, name in enumerate(ring) if name.lower() > self.cursor.lower()), 0)
+        for offset in range(len(ring)):
+            name = ring[(start + offset) % len(ring)]
+            if name.lower() not in busy_set:
+                return name
+        return None
+
+    def due(self) -> bool:
+        return self.proc is None and self.clock() >= self.next_at
+
+    def start(self, served: Iterable[str], busy: Iterable[str]) -> Optional[str]:
+        """Start one pass if one is due and a repository is eligible; returns it."""
+        if not self.due():
+            return None
+        repo = self.pick(served, busy)
+        now = self.clock()
+        # Move the schedule on BEFORE any filesystem work or the spawn: anything that raises
+        # (EACCES, ENOSPC, EMFILE, a missing python) then waits a full interval and the next
+        # repository, instead of failing and logging every second on the same one.
+        self.next_at = now + self.interval
+        if repo is None:
+            return None
+        self.cursor = repo
+        out_dir = os.path.join(self.root, "logs", "reap")
+        ensure_private_dir(out_dir)
+        ensure_private_dir(self.state_root(repo))
+        # stdout is the JSON digest and must stay parseable, so stderr goes to its own file.
+        self.out_path = os.path.join(out_dir, "last.json")
+        self.err_path = os.path.join(out_dir, "last.err")
+        for stale in (self.out_path, self.err_path):
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
+        try:
+            self.proc = self.spawn(self.argv(repo), self.env(), self.out_path, self.err_path)
+        except OSError as exc:
+            record_spawn("reap", exc)
+            raise
+        record_spawn("reap")
+        self.repo, self.started_at = repo, now
+        return repo
+
+    def poll(self, log: Optional[Callable[[str], None]] = None) -> None:
+        """Collect a finished pass (log what it deleted), or kill one that overran."""
+        if self.proc is None:
+            return
+        log = log or log_line
+        now = self.clock()
+        code = self.proc.poll()
+        if code is None:
+            if now - self.started_at > self.timeout:
+                log(f"reap {self.repo}: still running after {self.timeout:.0f}s; killing it")
+                _kill_group(self.proc, signal.SIGKILL)
+            return
+        self.proc = None
+        self.passes += 1
+        self.last_repo, self.last_at, self.last_rc = self.repo, now, code
+        self.next_at = now + self.interval
+        digest = read_json(self.out_path)
+        fixed = [str(item) for item in digest.get("fixed", [])] if isinstance(digest, dict) else []
+        problems = [str(item) for item in digest.get("problems", [])] if isinstance(digest, dict) else []
+        self.fixed_total += len(fixed)
+        for item in fixed:
+            log(f"reap {self.repo}: {item}")
+        if code not in (0, 1) or not isinstance(digest, dict):
+            tail = self._stderr_tail()
+            log(f"reap {self.repo}: rc={code}" + (f" problems={problems[:3]}" if problems else " (no digest)")
+                + (f" stderr: {tail}" if tail else ""))
+        elif problems:
+            log(f"reap {self.repo}: rc={code} problems={problems[:3]}")
+
+    def _stderr_tail(self) -> str:
+        """The last stderr line of the pass (for the log line of a failed one)."""
+        try:
+            with open(self.err_path, encoding="utf-8", errors="replace") as handle:
+                lines = [line.strip() for line in handle.read(8192).splitlines() if line.strip()]
+        except OSError:
+            return ""
+        return lines[-1][:200] if lines else ""
+
+    def stop(self) -> None:
+        """Dispatcher shutdown: a pass in flight is not worth waiting for."""
+        if self.proc is not None:
+            _kill_group(self.proc, signal.SIGTERM)
+            self.proc = None
+
+    def summary(self) -> Dict[str, Any]:
+        return {"passes": self.passes, "fixed": self.fixed_total, "last_repo": self.last_repo,
+                "last_at": self.last_at, "last_rc": self.last_rc, "running": self.repo if self.proc else ""}
+
+
 # ---------------------------------------------------------------------- dispatcher
 
 
+COMMIT_FILE = "COMMIT"  # written by `tartci owners install` at the root of a pinned export (no .git there)
+_FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+
+
+def recorded_commit(tartci_root: str) -> Optional[str]:
+    """The full commit a pinned export records in its COMMIT file, or None."""
+    try:
+        with open(os.path.join(tartci_root, COMMIT_FILE), encoding="utf-8") as handle:
+            text = handle.read().strip()
+    except OSError:
+        return None
+    return text if _FULL_SHA.match(text) else None
+
+
 def git_commit(tartci_root: str) -> str:
+    recorded = recorded_commit(tartci_root)
+    if recorded:
+        return recorded[:12]
     try:
         out = subprocess.run(["git", "-C", tartci_root, "rev-parse", "--short=12", "HEAD"],
                              capture_output=True, text=True, timeout=10)
@@ -1711,7 +2082,9 @@ class Dispatcher:
                  sleep: Callable[[float], None] = time.sleep,
                  tart: Callable[[List[str]], Any] = tart_runner,
                  alive: Optional[Callable[..., bool]] = None,
-                 born: Optional[Callable[[str], Optional[float]]] = None) -> None:
+                 born: Optional[Callable[[str], Optional[float]]] = None,
+                 reaper: Optional["ReapPass"] = None) -> None:
+        self.reaper = reaper
         self.cfg, self.root, self.tartci_root = cfg, root, tartci_root
         self.client, self.sched, self.scanner, self.directory = client, scheduler, scanner, directory
         self.clock, self.sleep, self.tart, self.born = clock, sleep, tart, born
@@ -1945,12 +2318,41 @@ class Dispatcher:
                 self._check_sustained()
                 self.next_scan = self.clock() + max(self.cfg.poll_seconds, 10)
         try:
+            self.reap_tick()
+        except Exception as error:
+            self._tick_error("reap pass", error)
+        try:
             self.write_snapshot()
             if self.clock() - self.last_prune >= PRUNE_EVERY_SECONDS:
                 self.last_prune = self.clock()
                 prune_children(self.root, self.sched.children, self.clock())
         except Exception as error:
             self._tick_error("housekeeping", error)
+
+    def reap_blocker(self) -> str:
+        """Why no registration-reap pass may start now ('' when one may). A pass spends the
+        same `gh` allowance as scanning, so it yields to everything that protects it."""
+        if self.sched.stopping or self._stop_signal is not None:
+            return "stopping"
+        if self.clock() < self.rate_block_until:
+            return "rate limited"
+        if self.error_since is not None:
+            return "GitHub unreachable"
+        headroom = self.client.rate.headroom()
+        if headroom is not None and headroom < REAP_MIN_HEADROOM:
+            return "low rate headroom"
+        return ""
+
+    def reap_tick(self) -> None:
+        """Collect a finished reap pass, and start the next one when it is due."""
+        if self.reaper is None:
+            return
+        self.reaper.poll()
+        if self.reaper.running or self.reap_blocker():
+            return
+        # A pass that finds nothing stays silent (poll() logs what it deleted and any failure); one every
+        # ~90 s per host would otherwise be ~1000 log lines a day.
+        self.reaper.start(self.directory.current.served, {c.repo for c in self.sched.children.values()})
 
     def startup(self) -> None:
         """Before serving: adopt live children of a previous process, then remove what
@@ -1970,10 +2372,16 @@ class Dispatcher:
     def run(self) -> int:
         self.startup()
         log_line(f"dispatcher up commit={self.commit} max_jobs={self.cfg.max_jobs} "
-                 f"poll={self.cfg.poll_seconds}s root={self.root} children_adopted={len(self.sched.children)}")
+                 f"poll={self.cfg.poll_seconds}s root={self.root} children_adopted={len(self.sched.children)} "
+                 f"spawn={spawn_mode()}")
+        if _spawn_libc() is None:
+            log_line("WARNING: children are started with plain Popen, not with the macOS responsibility "
+                     "disclaimed: under launchd their ssh to a VM can fail with 'No route to host'")
         while True:
             if self._stop_signal is not None:
                 log_line(f"signal {self._stop_signal}: stopping children")
+                if self.reaper is not None:
+                    self.reaper.stop()
                 try:
                     self.sched.shutdown()
                 except Exception as error:
@@ -1983,6 +2391,8 @@ class Dispatcher:
             self.tick()
             # Never exit while children run: a sustained-failure exit waits for them.
             if self.exit_code is not None and not self.sched.children:
+                if self.reaper is not None:
+                    self.reaper.stop()
                 self.write_snapshot(final=True)
                 return self.exit_code
             self.sleep(1.0)
@@ -2009,6 +2419,9 @@ class Dispatcher:
             "rate": {"remaining": self.client.rate.remaining, "limit": self.client.rate.limit,
                      "headroom": self.client.rate.headroom(), "requests": getattr(self.client, "requests", 0),
                      "not_modified": getattr(self.client, "not_modified", 0), "note": self.interval_note},
+            "reap": self.reaper.summary() if self.reaper is not None else None,
+            "spawn": spawn_mode(),
+            "spawn_error": {kind: dict(rec) for kind, rec in LAST_SPAWN_ERROR.items()} or None,
         }
 
     def write_snapshot(self, final: bool = False) -> None:
@@ -2124,10 +2537,21 @@ def cmd_run(args: argparse.Namespace) -> int:
     client = GhClient(cfg.gh_cli, env=env)
     sched = Scheduler(cfg, root, tartci_root, spawn=spawn_process,
                       admission=lambda: pool_admission_open(tartci_root))
-    dispatcher = Dispatcher(cfg, root, tartci_root, client, sched, Scanner(client), Directory(client, cfg))
+    dispatcher = Dispatcher(cfg, root, tartci_root, client, sched, Scanner(client), Directory(client, cfg),
+                            reaper=ReapPass(cfg, root, tartci_root))
     signal.signal(signal.SIGTERM, lambda signum, _frame: dispatcher.request_stop(signum))
     signal.signal(signal.SIGINT, lambda signum, _frame: dispatcher.request_stop(signum))
     return dispatcher.run()
+
+
+def service_lines(args: argparse.Namespace) -> List[str]:
+    """The pinned commit and LaunchAgent state (`install`'s), or nothing where launchd is absent."""
+    try:
+        import owners_service as svc  # noqa: PLC0415
+
+        return svc.status_lines(svc.Layout(home=os.path.expanduser("~"), root=os.path.abspath(args.root)))
+    except (ImportError, OSError, subprocess.SubprocessError):
+        return []
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -2140,15 +2564,26 @@ def cmd_status(args: argparse.Namespace) -> int:
         snap = None
     alive = bool(snap) and snap.get("running") and pid_alive(snap.get("pid"))  # type: ignore[union-attr]
     if args.json:
-        print(json.dumps({"running": alive, "snapshot": snap}, indent=2))
+        print(json.dumps({"running": alive, "snapshot": snap, "service": service_lines(args)}, indent=2))
         return 0 if alive else 1
     if not snap:
         print(f"owners dispatcher: no status recorded under {args.root} (not started yet)")
+        for line in service_lines(args):
+            print(line)
         return 1
+    for line in service_lines(args):
+        print(line)
     print(f"owners dispatcher: {'running' if alive else 'NOT running'} pid={snap.get('pid')} commit={snap.get('commit')}")
     print(f"  admitting={snap.get('admitting')} max_jobs={snap.get('max_jobs')} macos_cap={snap.get('macos_cap')}")
     if "vm_size" in snap:  # absent from a snapshot written before sizes were configurable
         print(f"  {format_vm_size(snap['vm_size'])}")
+    if snap.get("spawn"):
+        print(f"  child spawn: {snap['spawn']}")
+    spawn_errors = snap.get("spawn_error")
+    for kind, rec in sorted(spawn_errors.items()) if isinstance(spawn_errors, dict) else []:
+        if isinstance(rec, dict) and rec.get("error"):
+            age = int(time.time() - float(rec.get("at") or 0))
+            print(f"  LAST {kind.upper()} SPAWN FAILED {age}s ago: {rec['error']}")
     rate = snap.get("rate", {})
     headroom = rate.get("headroom")
     print(f"  rate remaining={rate.get('remaining')}/{rate.get('limit')} "
@@ -2166,6 +2601,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"    guarding {full}: not served, children still running")
     for full, count in sorted(snap.get("queued", {}).items()):
         print(f"    queued {full}: {count}")
+    reap = snap.get("reap")
+    if reap:
+        print(f"  registration reap: {reap.get('passes')} pass(es), {reap.get('fixed')} deleted, "
+              f"last {reap.get('last_repo') or '-'} rc={reap.get('last_rc')}"
+              + (f", running {reap['running']}" if reap.get("running") else ""))
     children = snap.get("children", [])
     print(f"  children: {len(children)}")
     for child in children:
@@ -2174,6 +2614,20 @@ def cmd_status(args: argparse.Namespace) -> int:
     for key, seconds in sorted(snap.get("backoff", {}).items()):
         print(f"    backoff {key}: {seconds}s")
     return 0 if alive else 1
+
+
+def cmd_service(args: argparse.Namespace) -> int:
+    """install / uninstall (scripts/owners_service.py, imported here so `run` never loads it)."""
+    import owners_service as svc  # noqa: PLC0415
+
+    layout = svc.Layout(home=os.path.expanduser("~"), root=os.path.abspath(args.root))
+    try:
+        if args.command == "install":
+            return svc.install(layout, tartci_root_dir(), args.config, args.rev, args.dry_run)
+        return svc.uninstall(layout, args.purge)
+    except svc.ServiceError as error:
+        print(f"owners {args.command}: {error}", file=sys.stderr)
+        return error.code
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -2185,10 +2639,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     dry = sub.add_parser("dry-run", help="print what would be served; start and mint nothing")
     dry.add_argument("--json", action="store_true")
     dry.add_argument("--scans", type=int, default=1, help="repeat the scan (measures 304 reuse)")
-    status = sub.add_parser("status", help="repositories, children, headroom, commit")
+    status = sub.add_parser("status", help="repositories, children, headroom, pinned commit, service")
     status.add_argument("--json", action="store_true")
+    install = sub.add_parser("install", help="export a commit and load the per-user LaunchAgent that runs the dispatcher")
+    install.add_argument("--config", default=argparse.SUPPRESS, help="owners.toml the agent serves (default: the global --config)")
+    install.add_argument("--rev", default="HEAD",
+                         help="commit to pin and run (default HEAD of this checkout: under jj, the parent of the working copy)")
+    install.add_argument("--dry-run", action="store_true", help="print the plist and the actions; change nothing")
+    uninstall = sub.add_parser("uninstall", help="unload the agent, remove its plist, check that no pool VM is left")
+    uninstall.add_argument("--purge", action="store_true",
+                           help="also remove the pool's exports, state, logs and cache (never goldens, the config or the VM key)")
     args = parser.parse_args(argv)
     try:
+        if args.command in ("install", "uninstall"):
+            return cmd_service(args)
         return {"run": cmd_run, "dry-run": cmd_dry_run, "status": cmd_status}[args.command](args)
     except ConfigError as error:
         print(f"owners: {error}", file=sys.stderr)
