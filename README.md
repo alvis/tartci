@@ -137,6 +137,9 @@ explains how the pieces fit, including GitHub-hosted runners as overflow.
 - [Gotchas](docs/gotchas.md): known failure modes and practical fixes.
 - [Onboarding a new repository](docs/new-repo-agent-guide.md): connect a repo to
   an existing TartCI host.
+- [Owner-wide runner pool](docs/owner-pool.md): serve every private repository
+  of some GitHub owners from one Mac (`tartci owners`), on `macos-a64`,
+  `linux-a64` and `linux-x64` labels.
 - [LaunchAgents](launchd/README.md) and the
   [published label table](fleet/README.md).
 - [AGENTS.md](AGENTS.md): a dense reference for coding agents.

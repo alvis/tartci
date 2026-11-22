@@ -330,7 +330,8 @@ the baseline tools a GitHub-hosted job expects, including Node.js LTS with
 lanes: on `linux-x64` the runner runs under Rosetta, but a job's `node` and
 `npm` run natively. A Linux golden also needs user `admin` with passwordless
 sudo and the public half of `TARTCI_VM_SSH_KEY` in its `authorized_keys`: the
-lane connects with key authentication only.
+lane connects with key authentication only, and `owners-golden.sh` finishes by
+making the guest's sshd refuse password login.
 The macOS JIT runner also enforces a bounded warm-cache capacity through
 `TARTCI_CCACHE_MAX_SIZE` (default `40G`) in the Actions runner environment, so
 each disposable VM shares compiler objects without falling back to ccache's
