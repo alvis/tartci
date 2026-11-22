@@ -43,14 +43,17 @@ FAKE_SSH = """\
 #!/bin/bash
 printf '%s\\n' "$*" >>"$FAKE_LOG/ssh.calls"
 case "$*" in
+  *'cat > ~/jit.cfg'*) cat >"$FAKE_LOG/jit-stdin"; exit "${FAKE_JIT_STREAM:-0}";;
   *'/mnt/rosetta'*) exit "${FAKE_ROSETTA_CHECK:-0}";;
-  *'./run.sh --jitconfig'*)
+  *'ACTIONS_RUNNER_INPUT_JITCONFIG='*)
     sleep 0.2  # stay alive past the pool-lock handoff's `kill -0` (an instant exit races it)
     echo 'Listening for Jobs'; echo 'Running job: smoke'; echo 'Job smoke completed'; exit 0;;
   *'prepare-ccache'*|*'bash -s'*) cat >/dev/null; exit 0;;
 esac
 exit 0
 """
+
+RUNNER_START = "ACTIONS_RUNNER_INPUT_JITCONFIG="
 
 FAKE_GH = """\
 #!/bin/bash
@@ -114,7 +117,7 @@ class LinuxRosettaLaneTests(unittest.TestCase):
         return runs[0]
 
     def runner_start(self, log: Path) -> str:
-        starts = [c for c in self.calls(log, "ssh") if "./run.sh --jitconfig" in c]
+        starts = [c for c in self.calls(log, "ssh") if RUNNER_START in c]
         self.assertEqual(len(starts), 1, starts)
         return starts[0]
 
@@ -155,6 +158,43 @@ class LinuxRosettaLaneTests(unittest.TestCase):
         self.assertIn("binfmt_misc/rosetta", ssh[check])
         self.assertIn("actions-runner-x64/run.sh", ssh[check])
 
+    def test_jit_config_travels_over_stdin_not_in_any_ssh_argument(self) -> None:
+        for rosetta in ("0", "1"):
+            with self.subTest(rosetta=rosetta):
+                proc, log = self.run_lane(TARTCI_LINUX_ROSETTA=rosetta)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                ssh = self.calls(log, "ssh")
+                self.assertFalse([c for c in ssh if "FAKE-JIT-CONFIG" in c], ssh)
+                self.assertEqual((log / "jit-stdin").read_text(encoding="utf-8"), "FAKE-JIT-CONFIG")
+                stream = next(i for i, c in enumerate(ssh) if "cat > ~/jit.cfg" in c)
+                self.assertIn("umask 077", ssh[stream])
+                self.assertLess(stream, ssh.index(self.runner_start(log)))
+                self.assertNotIn("FAKE-JIT-CONFIG", proc.stdout + proc.stderr)
+
+    def test_guest_reads_the_jit_config_from_the_environment_and_deletes_the_file(self) -> None:
+        # No `--jitconfig <value>` in the guest's argv (visible to every guest process for
+        # the whole job), and ~/jit.cfg is gone before the runner starts, as on macOS
+        # (guest-aqua-runner.sh).
+        for rosetta in ("0", "1"):
+            with self.subTest(rosetta=rosetta):
+                proc, log = self.run_lane(TARTCI_LINUX_ROSETTA=rosetta)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                ssh = self.calls(log, "ssh")
+                self.assertFalse([c for c in ssh if "--jitconfig" in c], ssh)
+                start = self.runner_start(log)
+                read = start.index('jit="$(cat ~/jit.cfg)"')
+                remove = start.index("rm -f ~/jit.cfg")
+                run = start.index('ACTIONS_RUNNER_INPUT_JITCONFIG="$jit" ./run.sh')
+                self.assertLess(read, remove)
+                self.assertLess(remove, run)  # deleted before the runner starts
+                self.assertEqual(start.count("jit.cfg"), 2)  # the one read and the one delete
+
+    def test_failed_jit_stream_discards_the_vm_and_never_starts_the_runner(self) -> None:
+        proc, log = self.run_lane(FAKE_JIT_STREAM="255")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertFalse([c for c in self.calls(log, "ssh") if RUNNER_START in c])
+        self.assertTrue([c for c in self.calls(log, "tart") if c.startswith("delete ")])
+
     def test_x64_runner_dir_is_configurable(self) -> None:
         proc, log = self.run_lane(
             TARTCI_LINUX_ROSETTA="1", TARTCI_LINUX_X64_RUNNER_DIR="runner-x64.v2"
@@ -167,7 +207,7 @@ class LinuxRosettaLaneTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("no usable Rosetta", proc.stderr)
         self.assertFalse([c for c in self.calls(log, "gh") if "generate-jitconfig" in c])
-        self.assertFalse([c for c in self.calls(log, "ssh") if "./run.sh --jitconfig" in c])
+        self.assertFalse([c for c in self.calls(log, "ssh") if RUNNER_START in c])
         tart = self.calls(log, "tart")
         self.assertTrue([c for c in tart if c.startswith("delete ")], tart)
 
