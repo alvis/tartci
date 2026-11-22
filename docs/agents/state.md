@@ -19,6 +19,8 @@ A git checkout of this repository is not what a host's supervisors run.
 | path | what |
 |---|---|
 | `governor.toml` | per-host governor settings (`tartci governor set`) |
+| `owners.toml` | the owner pool's owners, extra repos, exclusions, `max_jobs`, goldens, child VM sizes (`tartci owners`) |
+| `owners-vm-ed25519(.pub)` | the one SSH key the owner pool's goldens authorize |
 | `macos-fleet-profile.toml` | the host's fleet profile (`TARTCI_FLEET_PROFILE`) |
 | `macos-fleet-install.json` | install receipt: the services `pool on` restores |
 | `self-update.toml` | self-update settings (`[launcher] auto_apply = false` requires the manual launcher ack) |
@@ -61,3 +63,12 @@ path. Lanes that share a host must share one `TART_HOME`.
 Host addresses and the fleet's SSH table live in a separate private repository
 that a few scripts read at runtime through the GitHub App CLI. This repository
 holds no addresses. Treat that table as read-only.
+
+## Owner pool (`~/.tartci/owners/`, `TARTCI_OWNERS_ROOT`)
+
+| path | what |
+|---|---|
+| `state/dispatcher.json` | the running dispatcher's status snapshot (`tartci owners status`) |
+| `state/<child>/` | one `serve --once` child's runner state; `job-running` there means it was assigned a job. `owners-child.json` is the identity record written at spawn (name, lane, repo, slot, token, pid and the process's start time): a restarted dispatcher adopts a live child from it only when pid and start time still match, and the startup reaper deletes a leftover VM only when it matches. When the child exits the record is marked `ended` and its pid dropped, so it is never adopted. A record with a pid but no start time whose pid is still alive is kept by the reaper (dir never deleted, process never signalled) |
+| `cache/`, `fetchcontent-src/`, `logs/` | the children's CI cache, the macOS lane's fetchcontent source dir (pool-owned, 0700, so the lane never mounts `$HOME/Library/Caches/Pulp` into a guest) and VM logs; `logs/children/<child>.log` is each child's output |
+| retention | ended children's `state/<child>/` and `logs/children/*.log` (and per-VM `logs/{macos,linux}/*`) are removed after 7 days, and all but the newest 100; the root and its files are mode 0700 / 0600 |
