@@ -214,11 +214,20 @@ def effective_cap(cap_file: Path, default: int = DEFAULT_VM_CAP) -> int:
     return max(1, min(cap, HARD_MAX_VMS))
 
 
+def _stable_time_env() -> dict:
+    """The caller's environment with the C locale and no TZ, so `ps -o lstart=`
+    renders the way macos-vm-cap.lib.sh stores it whatever shell runs this."""
+    env = {k: v for k, v in os.environ.items() if k != "TZ" and not k.startswith("LC_")}
+    env.update({"LC_ALL": "C", "LANG": "C"})
+    return env
+
+
 def _pid_token(pid: int) -> str:
-    """Start time of `pid` with spaces removed (as macos-vm-cap.lib.sh stores it)."""
+    """Start time of `pid` with spaces removed (as macos-vm-cap.lib.sh stores it:
+    C locale, no TZ)."""
     try:
         out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True,
-                             text=True, timeout=5, check=False).stdout
+                             text=True, timeout=5, check=False, env=_stable_time_env()).stdout
     except (OSError, subprocess.SubprocessError):
         return ""
     return "".join(out.split())
