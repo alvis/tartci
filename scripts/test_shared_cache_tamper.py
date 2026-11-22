@@ -542,7 +542,7 @@ class LinuxGuestCommandTests(unittest.TestCase):
         self.assertIsNotNone(match, "Linux guest command not found")
         # Let bash expand the double-quoted host-side literal, as runner.sh does.
         result = subprocess.run(
-            ["/bin/bash", "-c", "jit=JIT; build_parallel_effective=4; printf '%s' " + match.group(1)],
+            ["/bin/bash", "-c", "jit=JIT; runner_dir=actions-runner; build_parallel_effective=4; printf '%s' " + match.group(1)],
             text=True, capture_output=True, check=True, env={"PATH": "/usr/bin:/bin"})
         return result.stdout
 

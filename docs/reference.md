@@ -309,6 +309,28 @@ same label without repo-scoped runner-name collisions.
 Repo / golden / labels are env-driven (`TARTCI_RUNNER_REPO`,
 `TARTCI_LINUX_GOLDEN` / `TARTCI_MACOS_GOLDEN` / `TARTCI_WIN_GOLDEN`,
 `TARTCI_RUNNER_LABELS`); see each `providers/*/runner.sh` header.
+The Linux lane can serve x64 jobs from the same arm64 golden:
+`TARTCI_LINUX_ROSETTA=1` (default `0`; anything but `0`, `1` or empty is
+refused) boots the clone with `tart run --rosetta=rosetta` and starts the
+golden's x64 Actions runner from `~/actions-runner-x64`
+(`TARTCI_LINUX_X64_RUNNER_DIR`, a plain directory name under the guest's
+`$HOME`) instead of the arm64 runner in `~/actions-runner`, so jobs see
+`RUNNER_ARCH=X64`. Before minting the JIT config the lane checks that the
+guest mounted the Rosetta share, registered x86_64 binfmt and has the x64
+runner; if not, it discards the VM and exits 1 without registering a runner.
+Pair it with an x64 label (`--labels self-hosted,linux-x64`). The Rosetta
+runtime must be installed on the host (Apple removes most of Rosetta 2 in
+macOS 28). `providers/tart-linux/owners-golden.sh` builds a project-neutral
+golden (`owners-linux`) for both lanes: the pinned Ubuntu base, both runners
+(sha256-verified), the amd64 libraries the x64 runner needs, a boot-time unit
+that mounts Rosetta and registers binfmt only when the share is attached, and
+the baseline tools a GitHub-hosted job expects, including Node.js LTS with
+`npm` and `npx` in `/usr/local/bin` (sha256-verified; `pnpm/setup`'s
+`runtime: node@...` installs node without npm). That Node is arm64 on both
+lanes: on `linux-x64` the runner runs under Rosetta, but a job's `node` and
+`npm` run natively. A Linux golden also needs user `admin` with passwordless
+sudo and the public half of `TARTCI_VM_SSH_KEY` in its `authorized_keys`: the
+lane connects with key authentication only.
 The macOS JIT runner also enforces a bounded warm-cache capacity through
 `TARTCI_CCACHE_MAX_SIZE` (default `40G`) in the Actions runner environment, so
 each disposable VM shares compiler objects without falling back to ccache's

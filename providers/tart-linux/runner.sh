@@ -49,6 +49,15 @@ GOLDEN="${TARTCI_LINUX_GOLDEN:-${PULP_LINUX_GOLDEN:-pulp-linux-build:latest}}"
 REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-Generous-Corp/pulp}}"
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,Linux,ARM64,pulp-build-linux}}"
 RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
+# Opt-in x64 lane: TARTCI_LINUX_ROSETTA=1 boots the clone with Apple's Rosetta
+# share (`tart run --rosetta=rosetta`) and runs the golden's x64 Actions runner
+# (default ~/actions-runner-x64, override with TARTCI_LINUX_X64_RUNNER_DIR, a
+# directory name under the guest's $HOME) instead of the arm64 one at
+# ~/actions-runner, so jobs report RUNNER_ARCH=X64. One golden serves both: the
+# guest mounts the share and registers x86_64 binfmt at boot (see
+# owners-golden.sh). Unset or 0 leaves every command this lane runs unchanged.
+ROSETTA="${TARTCI_LINUX_ROSETTA:-0}"
+X64_RUNNER_DIR="${TARTCI_LINUX_X64_RUNNER_DIR:-actions-runner-x64}"
 # Workflow name the --loop gate counts as "queued work". Override per repo.
 WORKFLOW_NAME="${TARTCI_RUNNER_WORKFLOW_NAME:-Build and Test}"
 # Host-health auto-yield (opt-in): TARTCI_HOST_VITALS_YIELD=1 makes the --loop gate
@@ -193,7 +202,7 @@ runtime_emit_complete(){
     --workflow "$WORKFLOW_NAME" \
     --provider tart-linux \
     --platform linux \
-    --arch arm64 \
+    --arch "$([ "$ROSETTA" = 1 ] && printf x64 || printf arm64)" \
     --runner-name "$runner_name" \
     --vm-name "$vm_name" \
     --labels "$LABELS" \
@@ -229,6 +238,16 @@ while [ $# -gt 0 ]; do case "$1" in
   *) die "unknown arg: $1";;
 esac; done
 case "$MAX_QUEUED_AGE_SECONDS" in ''|*[!0-9]*) MAX_QUEUED_AGE_SECONDS=0;; esac
+case "$ROSETTA" in
+  ''|0) ROSETTA=0;;
+  1) ;;
+  *) die "TARTCI_LINUX_ROSETTA must be 0 or 1 (got '$ROSETTA')";;
+esac
+# The directory name is spliced into the remote shell command: only a plain
+# name under $HOME is accepted.
+case "$X64_RUNNER_DIR" in
+  ''|*[!A-Za-z0-9._-]*|.|..) die "TARTCI_LINUX_X64_RUNNER_DIR must be a plain directory name (got '$X64_RUNNER_DIR')";;
+esac
 
 # Count fresh queued jobs whose labels this runner can satisfy. 0 on any gh
 # failure, treating a flaky API as "no work" so it does not spin VMs.
@@ -317,7 +336,13 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     return 1
   }
   local boot_log; boot_log="$logdir/tart-run.log"
-  tartci_vm_lease_guard_exec tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux" "$vm" >"$boot_log" 2>&1 & rpid=$!
+  local tart_run_args=(--no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux")
+  local runner_dir="actions-runner"
+  if [ "$ROSETTA" = 1 ]; then
+    tart_run_args+=(--rosetta=rosetta)
+    runner_dir="$X64_RUNNER_DIR"
+  fi
+  tartci_vm_lease_guard_exec tart run ${tart_run_args[@]+"${tart_run_args[@]}"} "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"
   write_state booting
 
@@ -352,6 +377,29 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     return 1
   fi
   prefix_guest_log "$logdir/ccache-setup.log"
+
+  if [ "$ROSETTA" = 1 ]; then
+    # Fail closed before any JIT registration: the guest must have the Rosetta
+    # runtime mounted, x86_64 binfmt registered and the x64 runner installed.
+    # A golden's boot unit normally did all of this; mount and register here
+    # only when it did not and the golden ships the registration helper.
+    write_state rosetta-check
+    if ! ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+      "sudo mkdir -p /mnt/rosetta && \
+       { mountpoint -q /mnt/rosetta || sudo mount -t virtiofs rosetta /mnt/rosetta; } && \
+       [ -x /mnt/rosetta/rosetta ] && \
+       { [ -e /proc/sys/fs/binfmt_misc/rosetta ] || sudo tartci-register-rosetta-binfmt; } && \
+       grep -q '^enabled' /proc/sys/fs/binfmt_misc/rosetta && \
+       [ -x \"\$HOME/$runner_dir/run.sh\" ]" \
+      >"$logdir/rosetta-setup.log" 2>&1; then
+      note "[$i] TARTCI_LINUX_ROSETTA=1 but the guest has no usable Rosetta runtime/binfmt or no ~/$runner_dir runner — discarding VM"
+      prefix_guest_log "$logdir/rosetta-setup.log"
+      discard_current_linux_vm
+      runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
+      return 1
+    fi
+    note "[$i] Rosetta share mounted, x86_64 binfmt registered, runner dir ~/$runner_dir"
+  fi
 
   if tartci_admission_clean_enabled; then
     local admission_json="" admission_rc=0
@@ -418,7 +466,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     "printf '%s' '$jit' > ~/jit.cfg && \
      mkdir -p ~/.config/ccache && touch ~/.config/ccache/tartci.conf && \
      export CCACHE_CONFIGPATH=\"\$HOME/.config/ccache/tartci.conf\" && \
-     cd ~/actions-runner && \
+     cd ~/$runner_dir && \
      touch .env && awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_CONFIGPATH)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' >> .env.tartci && \
      printf 'CCACHE_CONFIGPATH=%s\n' \"\$HOME/.config/ccache/tartci.conf\" >> .env.tartci && mv .env.tartci .env && \
