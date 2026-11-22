@@ -462,9 +462,22 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   # mount regression cannot silently turn every ephemeral job cold.
   # ccache reads its config from CCACHE_CONFIGPATH instead of the shared
   # cache directory any guest can write (see tart-macos/lane-cache-root.lib.sh).
+  # The JIT config reaches the guest over ssh stdin, never in an ssh argument:
+  # an argument is visible to every local process (`ps`) for the whole job. In the
+  # guest the runner reads it from ACTIONS_RUNNER_INPUT_JITCONFIG (the same way the
+  # macOS guest does), never from its argv, and ~/jit.cfg is deleted before the
+  # runner starts, so neither a process listing nor a job step's filesystem sees it.
+  if ! printf '%s' "$jit" | ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+    'umask 077; cat > ~/jit.cfg'; then
+    jit=""
+    tartci_pool_lock_release
+    note "[$i] failed to stream the JIT config into the guest — discarding VM"
+    discard_current_linux_vm
+    return 1
+  fi
+  jit=""
   ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
-    "printf '%s' '$jit' > ~/jit.cfg && \
-     mkdir -p ~/.config/ccache && touch ~/.config/ccache/tartci.conf && \
+    "mkdir -p ~/.config/ccache && touch ~/.config/ccache/tartci.conf && \
      export CCACHE_CONFIGPATH=\"\$HOME/.config/ccache/tartci.conf\" && \
      cd ~/$runner_dir && \
      touch .env && awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_CONFIGPATH)$/' .env > .env.tartci && \
@@ -476,7 +489,8 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
      printf 'TARTCI_DIAG ccache_dir=%s\n' \"\$CCACHE_DIR\" && \
      printf 'TARTCI_DIAG cmake_build_parallel_level=%s\n' \"\$CMAKE_BUILD_PARALLEL_LEVEL\" && \
      umask 0022 && runner_umask=\"\$(umask)\" && printf 'TARTCI_DIAG runner_umask=%s\n' \"\$runner_umask\" && \
-     [ \"\$runner_umask\" = 0022 ] && ./run.sh --jitconfig \"\$(cat ~/jit.cfg)\"" \
+     [ \"\$runner_umask\" = 0022 ] && jit=\"\$(cat ~/jit.cfg)\" && rm -f ~/jit.cfg && \
+     ACTIONS_RUNNER_INPUT_JITCONFIG=\"\$jit\" ./run.sh" \
     >"$logdir/runner-output.log" 2>&1 &
   CURRENT_RUNNER_PID=$!
   if ! tartci_pool_lock_handoff_to_listener "$CURRENT_RUNNER_PID"; then

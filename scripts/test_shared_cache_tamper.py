@@ -537,12 +537,12 @@ class LinuxGuestCommandTests(unittest.TestCase):
 
     def guest_command(self) -> str:
         source = LINUX_RUNNER.read_text(encoding="utf-8")
-        match = re.search(r'"\$VM_USER@\$ip" \\\n    ("printf \'%s\' \'\$jit\'.*?run\.sh --jitconfig .*?")\s*\\\n',
+        match = re.search(r'"\$VM_USER@\$ip" \\\n    ("mkdir -p ~/\.config/ccache.*?\./run\.sh")\s*\\\n',
                           source, re.DOTALL)
         self.assertIsNotNone(match, "Linux guest command not found")
         # Let bash expand the double-quoted host-side literal, as runner.sh does.
         result = subprocess.run(
-            ["/bin/bash", "-c", "jit=JIT; runner_dir=actions-runner; build_parallel_effective=4; printf '%s' " + match.group(1)],
+            ["/bin/bash", "-c", "runner_dir=actions-runner; build_parallel_effective=4; printf '%s' " + match.group(1)],
             text=True, capture_output=True, check=True, env={"PATH": "/usr/bin:/bin"})
         return result.stdout
 

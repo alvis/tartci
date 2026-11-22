@@ -12,8 +12,9 @@
 #     ~admin/.ssh/authorized_keys. Point the lane at the private half with
 #     TARTCI_VM_SSH_KEY.
 #   - the arm64 actions-runner at ~/actions-runner (the lane `cd`s there and
-#     runs ./run.sh --jitconfig). The x64 runner sits at ~/actions-runner-x64
-#     and is used only when TARTCI_LINUX_ROSETTA=1.
+#     runs ./run.sh with the JIT config in ACTIONS_RUNNER_INPUT_JITCONFIG). The
+#     x64 runner sits at ~/actions-runner-x64 and is used only when
+#     TARTCI_LINUX_ROSETTA=1.
 #   - `findmnt`, `mountpoint`, awk, bash (the ccache binding and .env edit).
 #   - baseline tools a GitHub-hosted job expects: git curl jq unzip zip
 #     build-essential python3 ...
