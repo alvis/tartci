@@ -1,9 +1,9 @@
 # Owner-wide runner pool
 
-Status: **polling pool implemented** (PRs 1–3 in [Delivery](#delivery)).
-Push discovery through `gh webhook forward` is PR 4 and not built yet; until
-it lands the pool polls. The choices behind the design are in
-[Decisions](#decisions).
+Status: **implemented** (PRs 1–4 in [Delivery](#delivery)). Discovery is
+event-driven only: supervised `gh webhook forward` processes signal queued jobs
+and a targeted scan decides what to serve. Nothing is polled (D16). The choices
+behind the design are in [Decisions](#decisions).
 
 ## Problem
 
@@ -51,9 +51,11 @@ emulate a whole x64 machine.
 
 Needs an Apple Silicon Mac with tartci's prerequisites (`./tartci doctor`),
 a `gh` login in the keychain that is an admin of every repository to serve
-(repository-scope JIT registration needs admin), and about 250 GB free for
+(repository-scope JIT registration needs admin), about 250 GB free for
 the two goldens and their base images (the macOS golden is about 97 GB on
-the host, its Xcode base about 89 GB, the Linux golden about 15 GB).
+the host, its Xcode base about 89 GB, the Linux golden about 15 GB) and,
+for push discovery, a second `gh` login that only the forwarders use
+(step 3).
 
 1. **The VM key and goldens.** Both goldens trust one host key,
    `~/.config/tartci/owners-vm-ed25519` (created on first use). Both build
@@ -95,7 +97,7 @@ the host, its Xcode base about 89 GB, the Linux golden about 15 GB).
 
 2. **The host's lease budget.** Each child leases its VM from tartci's host
    lease store. Its size is a ceiling, not a reservation: the guest boots at
-   the size step 3 sets per OS, but the lease charges at most `1/max_jobs` of
+   the size step 4 sets per OS, but the lease charges at most `1/max_jobs` of
    the host's non-gate budget on each axis (`non_gate_capacity_cores` and
    `non_gate_capacity_mem_mb`, shown by `./tartci host-profile --json`), and a
    child waiting for capacity holds room for that share only. So `max_jobs`
@@ -113,21 +115,61 @@ the host, its Xcode base about 89 GB, the Linux golden about 15 GB).
    ./tartci leases status        # e.g. 0/14 cores used (reserved gate 0)
    ```
 
-3. **The config,** `~/.config/tartci/owners.toml`:
+3. **The forwarder login.** Discovery runs one
+   `gh webhook forward` per target. Each one creates a repository or
+   organization webhook, which needs `admin:repo_hook` or `admin:org_hook`.
+   Those scopes go on a separate login, so the main login does not widen
+   (D13):
+
+   ```bash
+   gh extension install cli/gh-webhook     # once; the dispatcher runs its binary directly
+   GH_CONFIG_DIR=~/.config/tartci/gh-webhooks gh auth login --hostname github.com \
+     --git-protocol ssh --skip-ssh-key --web --insecure-storage \
+     --scopes admin:repo_hook,admin:org_hook
+   ```
+
+   Each part has a reason:
+   - **Its own directory.** `gh` keeps one login per host in each config
+     directory, so a second login needs a second directory
+     (`forwarder_gh_config_dir`).
+   - **`--insecure-storage`.** `gh` files keychain tokens under the host and
+     the user. A second login as the same GitHub user would overwrite the main
+     login's keychain entry. With `--insecure-storage` the token is written to
+     that directory's `hosts.yml` (0600) instead, and the keychain is left
+     alone.
+   - **`GH_TOKEN`.** `gh` prefers the keychain to `hosts.yml`, so pointing
+     `GH_CONFIG_DIR` at the directory is not enough: it would still find the
+     main login. The dispatcher reads `oauth_token` from `hosts.yml` itself and
+     passes it only as `GH_TOKEN` in each forwarder's environment. It never
+     logs, prints or writes the token, and no child or VM gets it.
+
+   `gh auth login` always adds its own minimum scopes, so this login also
+   holds `repo`, `read:org` and `gist`, not only the two hook scopes. It is
+   still kept away from every child and VM. Do not run `gh auth logout`,
+   `refresh` or `switch` with that `GH_CONFIG_DIR`: `gh` may also act on the
+   keychain entry it shares with the main login.
+
+   `run` exits 2 at startup, as for any other configuration error, when this
+   login is missing or its `hosts.yml` cannot be read: without it no forwarder
+   can start, and there is no polling fallback, so the pool would serve
+   nothing while looking healthy.
+
+4. **The config,** `~/.config/tartci/owners.toml`:
 
    ```toml
-   owners = ["alvis", "theriety"]  # users or organizations
-   repos = []                # extra private owner/repo entries
+   owners = ["theriety"]     # organizations: each is served whole by one org forwarder
+   repos = ["alvis/app"]     # private owner/repo entries; a personal account's repositories go here, one by one
    exclude_repos = []
    max_jobs = 4              # concurrent jobs, 1-16
    max_macos = 2             # 0-2; Apple's guest limit is 2
-   poll_seconds = 10         # scan interval; widened on its own when rate headroom is low
    gh_cli = "gh"             # the GitHub CLI the dispatcher and its children run (default "gh")
+   forwarder_gh_config_dir = "~/.config/tartci/gh-webhooks"  # the forwarder login (step 3)
+   forwarder_port = 0        # the receiver's port on 127.0.0.1; 0 picks a free one
+   rotate_seconds = 3600     # planned restart of each forwarder, then a catch-up; 0 off, else 600-86400
    # macos_vm_cores = 4      # child VM size per OS, cores 1-64, memory 2048-524288 MB;
    # macos_vm_mem_mb = 10240 # a key left unset leaves the lane's own sizing (step 2)
    # linux_vm_cores = 3
    # linux_vm_mem_mb = 8192
-   # reconcile_seconds and push are read but unused until push lands (PR 4)
 
    [golden]                  # optional; these are the defaults
    macos-a64 = "owners-macos"
@@ -142,10 +184,23 @@ the host, its Xcode base about 89 GB, the Linux golden about 15 GB).
    `GH_TOKEN` and `GITHUB_TOKEN` scrubbed. Unknown keys are an error, so a
    typo never silently changes behaviour.
 
-4. **Check, then install.**
+   `push`, `reconcile_seconds` and `poll_seconds` were removed (D16): a config
+   that still sets one, to any value, is refused with exit 2 and a message
+   naming it (`run`, `dry-run` and `install`). Delete the line.
+   `rotate_seconds` is also what re-lists the owners now: each rotation ends
+   in a catch-up, which re-lists them when the last full listing is 15
+   minutes old. With `rotate_seconds = 0` the owners are re-listed only when a
+   forwarder re-establishes on its own (GitHub drops one every hour or two),
+   and on the event-driven paths in [Discovery](#discovery).
+
+   A personal account in `owners` is refused (`run` and `dry-run` exit 2 and
+   name the account); list its private repositories in `repos` instead. See
+   [Repositories](#repositories).
+
+5. **Check, then install.**
 
    ```bash
-   ./tartci owners dry-run       # what would be served, per owner and repo; starts nothing
+   ./tartci owners dry-run       # what would be served, per owner and repo, and the forwarders it would run; starts nothing
    ./tartci owners install       # pin this commit, write and load the LaunchAgent
    ./tartci owners status        # repositories, children, child VM size, rate headroom, pinned commit
    ```
@@ -167,7 +222,10 @@ jobs:
 
 ```mermaid
 flowchart LR
-  poll[scan every poll_seconds] --> d[tartci owners run]
+  gh[(GitHub)] -- workflow_job --> f[gh webhook forward, one per org or registered repo]
+  f -- signed POST --> r[receiver on 127.0.0.1]
+  r -- hint --> d[tartci owners run]
+  d -- targeted scan --> gh
   d -- one per queued job --> s1[tartci serve macos --once]
   d --> s2[tartci serve linux --once]
   d --> s3[tartci serve linux --once, Rosetta]
@@ -251,30 +309,229 @@ The dispatcher adds an outer cap. It does not replace the inner one:
 ### Repositories
 
 - The served set is the **private, non-archived** repositories of `owners`,
-  plus private `repos`, minus `exclude_repos`, listed again every 15
-  minutes. A public repository is never served, even when listed by hand,
-  and `status` reports it as refused.
+  plus private `repos`, minus `exclude_repos`. A public repository is never
+  served, even when listed by hand, and `status` reports it as refused. When
+  the owners are listed again is in [Discovery](#discovery).
+- **Registration (push).** An organization in `owners` gets one organization
+  forwarder that covers every repository it has now or creates later. A
+  personal account's repositories are served only when each is listed in
+  `repos`, and each gets a repository forwarder: GitHub has no account-wide
+  webhook for a user. A personal account in `owners` is refused at startup
+  (a config error, exit 2) rather than ignored, so it cannot look served
+  while nothing is listening for it. A `repos` entry of an organization that
+  is already in `owners` needs no forwarder of its own.
 - Each repository is checked before it is served: admin rights, not
   archived or disabled, and "Run workflows from fork pull requests" off. A
   repository that fails is refused and listed in `status`.
 
 ### Discovery
 
-Each served repository is scanned every `poll_seconds`. A scan sends one
-conditional request for the repository's metadata and one for its recent
-runs (`If-None-Match`, so an unchanged answer is a 304 and costs nothing
-against the primary limit). For each run that is queued or in progress it
-lists the queued jobs and keeps those whose labels fit one lane. A failed
-scan is an error, never "0 queued", and starts nothing.
+Events are hints and the scan stays the truth (D15). Nothing is polled (D16):
+between the triggers below the dispatcher makes no REST call at all, even
+while children run. The one bounded exception is the leftover-registration
+reap pass (see Lifecycle): for 3 h after a child of a repository ends badly,
+that repository is visited about every 90 s.
+
+- **Hints.** Each forwarder relays its target's `workflow_job` events to the
+  receiver. A `queued` event for a served repository whose labels fit a lane
+  triggers a scan of that one repository. Nothing in the payload admits a job:
+  the scan re-reads the runs, jobs, head repositories and settings. GitHub's
+  run listings can trail the event by minutes: live, two `workflow_dispatch`
+  runs were missing from the listing 17 s and 32 s after their events and
+  appeared about 2 minutes later (`?status=queued` lagged longer still), and
+  list answers may be up to 60 s stale (`Cache-Control: s-maxage=60`). So a
+  hinted job that a clean scan does not list stays pending, and its repository
+  is rescanned 15, 30, 60, 120 and 240 s apart, until 10 minutes after the
+  event (at most six rescans). Before each rescan the job is read directly
+  (`GET repos/{repo}/actions/jobs/{id}`, conditional): if it is in progress or
+  completed (another runner took it, or it was cancelled), or answers 404 at a
+  second recheck (one 404 may be lag too), the hint is settled with no rescan.
+  The rescan reads each run's jobs fresh, as a run's job list can trail the
+  event too. A failed scan keeps the hint (the retry rescans). A job still
+  unlisted after 10 minutes is logged and left to the next catch-up. The
+  direct read never serves the job: a repository's runner takes any queued job
+  that fits its labels, so only a scan, which checks every active run's head
+  repository first, may start a child. A repository that stops being served
+  drops its hints. With nothing hinted, nothing is read. A freed slot is seen
+  locally, when the child exits.
+- **Guard requests.** Any `workflow_job` event (any action, any labels) of a
+  repository that has children triggers the fork-head guard for it: a served
+  repository is scanned (the scan checks every run's head repository before
+  it serves anything), an unserved one has its runs re-read by the guard (see
+  [Security](#security)). A fork run's own events (`queued`, `waiting`,
+  `in_progress`) reach the dispatcher this way. Only a lane job ever starts a
+  child, so an event of a hosted-runner job only costs the guard's scan. An
+  event of a repository with no children that is not a lane's `queued` job
+  costs nothing.
+- **Catch-up.** When a forwarder is established (its signed `ping`, or 30 s
+  alive without one), every served repository it covers is scanned once, so a
+  job queued while it was down is served, and every repository with children
+  is guarded. This happens at startup, after every restart and after every
+  rotation. If the listing of the forwarder's organization (or repository)
+  failed, its repositories are not all known yet: the catch-up scans those
+  known and waits, and runs once more only when that listing succeeds (a
+  retry that fails again rescans nothing).
+- **Backlog.** Queued jobs a scan could not serve (the caps were full, a
+  backoff, admission closed) are remembered per repository, and so is the
+  repository of a child that exits without taking its job (a failed clone,
+  JIT mint or ssh): no event says that job is still queued. Only those
+  repositories are scanned again: when a child exits, when the backoff ends,
+  or when admission reopens (checked locally every 10 s, no GitHub call). A
+  repository that is no longer served leaves the backlog (and the retries).
+- **Failed scans.** A scan that fails (a 5xx, a timeout, a rate limit) never
+  drops what asked for it: the repository is scanned again after 10 s, then
+  after twice that, up to 5 minutes, until a scan succeeds. A backlog entry
+  whose rescan fails waits for the same retry, and so does a failed guard
+  reading of an unserved repository with children (no event may come for
+  it). If a whole cycle raises, its hints, guard requests and catch-ups are
+  kept and tried again after the same growing delay. A 404 from a run's jobs
+  means the run was deleted after the runs were listed: that run is skipped,
+  the rest of the scan stands. A 404 on the repository or its runs is
+  different: the repository may be deleted, renamed or no longer readable, so
+  it is not served (its children expire, the fork-head guard watches them)
+  and that repository alone is listed again 60 s later, so a passing 404
+  costs about a minute. If it answers 404 again it waits for the next full
+  listing.
+- **Newly served.** After every listing, a repository that has just become
+  served (its fork setting turned off, admin granted) is scanned at once.
+- **Listing the owners.** In full: at startup, and on a catch-up when the
+  last full listing is 15 minutes old (so about once per `rotate_seconds`;
+  see the config above for `rotate_seconds = 0`). Partly: once (at most every
+  60 s) when an event names a repository of an organization owner that is
+  not known yet, so a new repository is served from its first queued job
+  (while that owner's listing fails, the repository is asked about again at
+  that listing's retry); a repository that answered 404 (above); and a
+  failed listing. A listing that failed with no answer, a 5xx or a rate limit
+  is retried after 10 s, then twice that, up to 5 minutes, until one
+  succeeds; one GitHub refused (a 4xx such as a 403 for an organization's
+  SAML SSO, or an owner that is not listable) is retried only at the next
+  catch-up (a rotation or a re-establish). Either retry re-lists only what
+  failed.
+- **Idle cost.** An idle pool, and one whose children just run their jobs,
+  make no REST calls with the main login: no scans, no listings, no reap
+  pass (see [Lifecycle](#lifecycle)). Forwarder health is checked locally.
+  Each hook is read over REST with the forwarder login only every 30
+  minutes, or when the local check looks wrong.
+
+A scan sends one conditional request for the repository's metadata and one
+for its recent runs (`If-None-Match`, so an unchanged answer is a 304 and
+costs nothing against the primary limit). For each run that is queued or in
+progress it lists the queued jobs and keeps those whose labels fit one lane.
+A failed scan is an error, never "0 queued", and starts nothing.
 
 The same `gh` login also serves tartci's own lanes, so the dispatcher tracks
-headroom from `X-RateLimit-Remaining`, widens the interval on its own below
-25% headroom (up to 900 s), honours `Retry-After` and secondary limits, and
-shows the headroom in `status`. Across 94 repositories a dry run measured
-about 2 requests per repository per scan, most of them 304s.
+headroom from `X-RateLimit-Remaining`, honours `Retry-After` and secondary
+limits (every scan waits until then; nothing asked for is dropped), keeps its
+own requests above a floor of the remaining limit, and shows the headroom in
+`status`. Across 94 repositories a dry run measured about 2 requests per
+repository per scan, most of them 304s.
 
-Push (PR 4) will add `gh webhook forward` as a hint that triggers an
-immediate scan; the scan stays the truth.
+### Forwarders
+
+- **One process per target.** The dispatcher runs the extension's binary
+  directly, `gh-webhook forward --org O` (or `--repo R`) `--events
+  workflow_job --url http://127.0.0.1:<port>/f/<target> --secret S`, in its
+  own session and process group. Its environment is `PATH`, `HOME`, `TMPDIR`,
+  `USER`, `LOGNAME`, the forwarder token as `GH_TOKEN`, `GH_CONFIG_DIR` and
+  no prompts. Without the extension's binary it falls back to
+  `gh webhook forward`. Each start creates a webhook named `cli` on GitHub,
+  and GitHub deletes it within seconds of the forwarder's connection ending.
+- **The receiver** is one HTTP server on `127.0.0.1` (`forwarder_port`, or a
+  free port). It takes only a POST to the path of a configured target, with a
+  `Content-Length` of at most 1 MiB and a valid `X-Hub-Signature-256`, an
+  HMAC under a random secret made at each dispatcher start and held only in
+  memory, and it gives each request 10 s to arrive. Anything else is dropped
+  (401, 404, 411 or 413) and counted in `status`. It acts on `ping` and
+  `workflow_job` only, and it never logs a payload. A `ping` for a target
+  whose forwarder is not running is ignored, and an event for a repository
+  its target does not cover is dropped.
+- **Rotation.** Every `rotate_seconds` (default 3600) an up forwarder is
+  restarted on purpose, before GitHub drops it, and scanned once (the
+  catch-up) when its new `ping` arrives. Each target gets a fixed stagger of
+  up to 10% of the period (at most 5 minutes), so the targets do not all
+  rotate in the same minute. A rotation is not an error and does not back
+  off; `status` counts it under `rotations`, apart from `restarts`. Set
+  `rotate_seconds = 0` to leave a forwarder until it exits on its own.
+- **Restart.** A forwarder that exits after running for a while is restarted
+  after 5 s and catches up once it is up. GitHub drops a long-lived forwarder
+  every hour or two (`close 1006`, exit 1); rotation makes these rare.
+- **Backoff.** `HTTP 422 Hook already exists`, a login error, a failed start,
+  or an exit within 60 s of starting or of coming up backs off 10, 20, 40,
+  80, then 120 s. The ladder resets only once a forwarder has stayed up for
+  60 s, so one that pings and dies again and again is held to a catch-up
+  scan every 2 minutes or so. Forced restarts (a stall, a hook gone) that
+  repeat within 10 minutes climb the same ladder. A planned rotation never
+  counts as a failure.
+- **Stale hooks.** A `cli` hook that outlived its forwarder blocks the next
+  one with 422. After 60 s of 422 the dispatcher deletes that target's hook
+  only if this pool recorded creating it (its id came in that target's
+  `ping`, kept in `state/forwarders.json`) and its name is still `cli`. Any
+  other hook is left alone, and the forwarder keeps backing off.
+- **Stalls.** Every 20 s one `ps` and one `lsof` look at every forwarder's
+  process group. A stopped forwarder (state `T`) is restarted at once. If its
+  GitHub socket is in `CLOSE_WAIT`, or it has no `ESTABLISHED` socket, its hook
+  is read over REST; if the same reading comes twice in a row, it is
+  restarted. `lsof` exits 1 both when nothing matched and when it failed: an
+  exit 1 with no output at all means no socket (a strike), one with a message
+  on stderr is "unknown", neither a strike nor a clean reading.
+  A hook that has gone from GitHub (read every 30 minutes) also restarts it.
+- **Owner type.** An organization owner whose account type cannot be read at
+  startup is never assumed to be an organization: its forwarder waits
+  (`checking`) while the type is read again on the backoff ladder. A personal
+  account found that way is `refused`, and its forwarder never starts; so is
+  an account of any other type (a `Bot`...), and an organization whose type
+  nothing can read. Only a failed read is retried.
+- **While a target is down** nothing new is served for its repositories.
+  There is no polling fallback: jobs stay queued and the catch-up serves them
+  once it is back. The failure is shown in `status`. A target that cannot
+  start for a login error (or an unreadable account type) is logged as DOWN,
+  with "nothing is served", at once; a target that has not been up for 10
+  minutes for any other reason (422 for ever, a missing `gh-webhook` binary,
+  exits) is logged the same way. Either repeats at most every 10 minutes,
+  and stops once the target is up.
+- **No orphans.** Each forwarder's pid, process group and start time are
+  recorded in `state/forwarders.json`, and so are the pid and start time of
+  each other member of its group (the gh-webhook child of `gh webhook
+  forward`), learned by the 20 s check from one `ps` reading (also before the
+  forwarder's `ping`); a member whose start time that reading lacks is not
+  recorded. Whenever `run` exits (SIGTERM, exit 75
+  or an error), every forwarder group gets SIGCONT, SIGTERM and, after 3 s,
+  SIGKILL. Killing only the `gh` parent would orphan its child. The next
+  `run` (first thing, before it reads the configuration, and with `push =
+  false` too) and `uninstall` also
+  stop any recorded forwarder still alive whose pid and start time both
+  match. When that leader is gone but a recorded group member still matches
+  (the `gh` parent died with the dispatcher, its child kept the hook), that
+  member is stopped on its own. A process whose start time does not match is
+  never signalled. Logs go to `<root>/logs/forwarders/<target>.log` (0600,
+  reset above 1 MiB).
+
+`tartci owners status` shows discovery and one line per forwarder:
+
+```text
+  discovery: push via gh-webhook, receiver 127.0.0.1:52144; last scan 12s ago, last discovery 41m ago
+    scans by reason: backlog=1, catchup=3, discovery=2, guard=14, hint=9; events: completed=9, queued=9; hook API calls 2
+    forwarder org theriety: up, for 41m, rotates in 22m, restarts=2, rotations=5, pid=321, hook=77, last event 12s ago, last catch-up 41m ago
+    forwarder repo alvis/app: backing-off, retry in 40s, restarts=5, last event never, last catch-up never
+      last error: rc=1: HTTP 422: Validation Failed (...) Hook already exists on this repository
+```
+
+A forwarder's state is `checking` (its owner's account type is being read),
+`starting` (waiting for its `ping`), `up` (with the time to its next
+rotation), `rotating` (a planned restart, back in 5 s), `backing-off` (with
+the time to its next start), `stalled` (being restarted after a stall),
+`refused` (a personal account in `owners`) or `stopped`. The scan reasons are
+`hint`, `guard`, `catchup`, `backlog`, `retry`, `recheck`, `discovery`,
+`relist` and `newly-served`; there is no `work` cadence and no "next scan"
+any more (D16), and the rate line notes a wait GitHub asked for. A `queued`
+line in `status` says how old its scan is, and repositories waiting for a
+retry after a failed scan are listed. A `hinted jobs` line, once there has
+been one, shows the hints still pending per repository and how the others
+were settled (`listed`, `taken`, `gone`, `expired`, `dropped`). The other fields are its uptime, unplanned
+restarts, planned rotations, pid,
+the hook id from its `ping`, its last event and last catch-up, and its last
+error. Every value shown is masked: anything shaped like a `gh` token
+(`gh[opsu]_…`) prints as `gh*_***`.
 
 ### Security
 
@@ -287,12 +544,22 @@ immediate scan; the scan stays the truth.
   waiting children, and those assigned in the last 15 s, are stopped; on a
   fork-headed run the dispatcher also reads that run's jobs and stops the
   child holding one, assigned or not (every child of the repository if the
-  jobs cannot be read). This guard keeps running every scan for a dropped
-  repository until its children are gone. Other drops (archived, admin lost,
-  a setting unreadable) only stop new children; waiting ones expire.
+  jobs cannot be read). This guard keeps running for a dropped repository
+  until its children are gone, in every cycle that runs for any reason. Other
+  drops (archived, admin lost, a setting unreadable) only stop new children;
+  waiting ones expire.
+- **When the guard runs (D16).** The fork-head check runs on events, not on
+  a timer: on any `workflow_job` event of a repository with children, on
+  every catch-up, and in every cycle while a repository with children is
+  unserved. A fork run's job reaches a runner only through an event GitHub
+  sends to the forwarders, so while they are up that event triggers the
+  check. See [Limits](#limits) for the accepted gap.
 - **The GitHub token stays on the host.** The dispatcher and its children use
   the keychain `gh` login only (`GH_TOKEN` and `GITHUB_TOKEN` are scrubbed,
-  so the dispatcher and children always authenticate the same way). Only
+  so the dispatcher and children always authenticate the same way). The
+  forwarder login's token goes only into the forwarders' environment, never
+  into a child's or a VM's, and the dispatcher never runs `gh auth login`,
+  `refresh`, `logout` or `switch`. Only
   the one-job JIT config enters a VM: it is sent over ssh stdin, read and
   deleted in the guest, and handed to the runner in its environment.
 - **Key-only SSH into pool VMs.** The serving lanes reach a guest with
@@ -326,6 +593,16 @@ immediate scan; the scan stays the truth.
   Tart upgrade. Enforcing it independently with `tart run --net-softnet` is a
   possible follow-up (it needs a privileged helper and changes how guests reach
   the host, so it is not done here).
+- **Events never admit a job.** A forged or replayed event can at most cause
+  a scan of a repository that is already served. Admission, labels, fork
+  heads and settings always come from the scan.
+- **The receiver secret is visible in `ps`.** `gh webhook forward` takes the
+  secret only as `--secret`, so any local user can read it from the process
+  list while the dispatcher runs, and could then send signed requests to the
+  receiver. Such a request can trigger scans, mark a forwarder up early, or
+  record a hook id for a target; the stale-hook rule above would then delete
+  that hook only if it is named `cli`. This is a known local exposure,
+  accepted on a single-user host.
 - **Pinned, no self-update.** The LaunchAgent runs an exported, recorded
   commit of this fork. `status` shows it, updating is `install` from a
   reviewed checkout, and the self-update agent is not installed.
@@ -335,9 +612,35 @@ immediate scan; the scan stays the truth.
 - **GitHub unavailable.** Failing scans start nothing. After about 3 minutes
   of continuous failure (rate limits excepted: they are waited out) the
   dispatcher stops admitting children and exits 75 once no children
-  remain, so launchd restarts it.
+  remain, so launchd restarts it. The dispatcher scans a few repositories at
+  a time, so one repository whose endpoint keeps failing is not enough.
+  Scans run only on their triggers, so an outage is noticed on the next one
+  (an event, a catch-up or a retry); with none, nothing is read and nothing
+  counts.
+  Only failures with no HTTP answer, or a 5xx, count (a 4xx is GitHub
+  answering): scans of two different repositories must have failed so with
+  no answer in between, or of every served repository, or a scan and a
+  listing. Even then the outage counts only once `GET /rate_limit` (free)
+  fails too; if it answers, those repositories are failing on their own and
+  are only retried.
+- **Login rejected.** When GitHub answers 401 to every scan of a cycle (or to
+  a listing, or to `GET /rate_limit`), the main login was revoked or logged
+  out. The dispatcher logs `ERR GitHub rejects the dispatcher's login (HTTP
+  401): the pool is DOWN` at once and then at most every 10 minutes, until a
+  scan succeeds. It does not exit for it: a restart cannot fix the login, and
+  would only tear down and re-create every forwarder each time; it keeps its
+  forwarders up and serves again from the first scan after `gh auth login` is
+  redone.
+- **One dispatcher per pool root.** `run` takes an exclusive lock on
+  `state/run.lock` before anything else, before it stops a previous run's
+  forwarders. A second `run` for the same root (a manual one while the
+  service runs) prints which pid holds it, changes nothing and exits 3;
+  under launchd that is retried every 30 s and takes over once the other
+  instance has exited. The lock is released with the process, never left
+  behind.
 - **Logout, restart and `uninstall`.** launchd sends SIGTERM; the dispatcher
-  stops its children, which delete their VMs and registrations. launchd caps
+  stops its forwarders (GitHub removes their hooks within seconds) and its
+  children, which delete their VMs and registrations. launchd caps
   a user agent's `ExitTimeOut` at 60 s, shorter than the dispatcher's 150 s
   child grace; children run in their own sessions, so they keep cleaning up
   after the dispatcher is gone. Jobs in flight at logout fail and can be
@@ -345,9 +648,12 @@ immediate scan; the scan stays the truth.
 - **Startup.** The dispatcher deletes VMs left by a crash before it serves:
   only VMs named for its own children whose recorded child is gone.
 - **Leftover registrations.** A crashed child leaves its JIT registration
-  behind, offline. A slow reap pass visits one served repository every 90 s
-  (all 94 in about 2.4 h), skipping repositories with a live child and pausing
-  while rate-limited. It runs tartci's reaper with `--runners-only --scopes
+  behind, offline. A slow reap pass visits only repositories where a child
+  ended badly in the last 3 h, one every 90 s (nothing otherwise; a child
+  that deferred with exit 75 before writing any state registered nothing and
+  does not count; after a restart, only the previous process's children not
+  recorded as ended cleanly count), skipping
+  repositories with a live child and pausing while rate-limited. It runs tartci's reaper with `--runners-only --scopes
   repository` (no VM calls, no state files). What it removes, and what it can
   therefore reach:
   - **Scope.** Only **repository-scope** registrations of that one repository.
@@ -361,6 +667,11 @@ immediate scan; the scan stays the truth.
     uses**, not a pool-only name.
   - **Kept.** A runner carrying a `pulp-host-*` label (another host's lane) is
     never deleted.
+
+  The reap pass visits only repositories where a child ended with an error
+  or was killed in the last 3 hours, so an idle pool makes no reap calls once
+  those 3 hours have passed: the one bounded exception to "no REST call
+  between triggers", besides the 30-minute hook check.
 
   So an offline `linux-ephr-<pid>-<n>` registration left by another host, or
   by another tartci Linux lane on this host, that serves one of the same
@@ -378,6 +689,16 @@ with `RunAtLoad`, `KeepAlive`, `ExitTimeOut` and logs in
 `caffeinate -i` around the dispatcher (caffeinate execs it in place, so
 launchd's SIGTERM reaches the dispatcher directly) so the Mac does not idle
 sleep mid-job.
+
+`KeepAlive` restarts the dispatcher whatever its exit, at most every 30 s
+(`ThrottleInterval`). A configuration error exits 2, so a config that stopped
+parsing (or still sets a removed key: `push`, `reconcile_seconds`,
+`poll_seconds`), a personal account in `owners` or a missing forwarder login
+makes it start, stop any leftover forwarders and exit 2 every 30 s, with the
+reason in `owners.err.log` each time, until the config is fixed or the agent
+is uninstalled. `install` refuses (exit 2, nothing changed) a config that does
+not parse or sets a removed key, and a missing forwarder login, so this loop
+needs a change made after `install`.
 
 It is a LaunchAgent, not a LaunchDaemon, because Tart needs the login
 keychain unlocked. With FileVault on, the pool therefore starts after the
@@ -474,7 +795,41 @@ rebuild.
 - **FileVault.** The pool starts at login, not at boot.
 - **Logout.** Jobs in flight fail and can be re-run.
 - **One host.** Each host runs its own pool against the same owners; GitHub
-  hands a job to whichever runner asks first.
+  hands a job to whichever runner asks first. A second host's
+  forwarder for a target that already has a `cli` hook gets 422 and backs off
+  without serving it.
+- **Lost events.** An event sent between a forwarder's silent stall and its
+  detection is lost: about 40 s for a socket the local check catches, or up
+  to the 30-minute hook check for one that looks healthy (or that `lsof`
+  cannot read) but receives nothing. A job queued in that window waits for
+  the catch-up after the restart, or for the next event of its repository.
+  An event that did arrive is not lost to a failed scan, a child that never
+  took its job, a failed listing, or a run listing that trails it by up to
+  10 minutes (see [Discovery](#discovery)). A job GitHub still does not list
+  after that waits for the next catch-up (about an hour at the default
+  `rotate_seconds`) or the next event of its repository.
+- **Hook churn.** Every forwarder start creates a webhook and every stop
+  deletes it. Rotation makes that about one per hour per target, plus any
+  unplanned restarts, each visible in the hook settings and the audit log.
+- **Rotation gap.** Between stopping a forwarder and its successor's `ping`
+  (about 5–10 s, longer if the old hook lingers and the new one backs off on
+  422) no event arrives; the catch-up scan serves what queued meanwhile.
+- **Fork run in a forwarder gap (accepted risk, D16).** The fork-head guard
+  runs on events and catch-ups only. Suppose a fork-headed run's job is queued
+  while that repository's forwarder is down, stalled or rotating, in a
+  repository that has a waiting child. Suppose too that its fork-PR setting
+  was turned on since the last listing (less than about an hour ago, at the
+  default `rotate_seconds`). GitHub can then assign the job to that waiting
+  runner with no event reaching the dispatcher. The job runs in the child's
+  VM until the next event of that repository or the catch-up after the gap.
+  The guard then stops the child, and the next listing refuses the
+  repository. The polling cadence closed this window within 10 s. It was
+  given up so that no REST call is made between triggers, and the operator
+  accepted the risk. Keep the fork-PR setting off on served repositories: a
+  listing refuses any repository where it is on, and any scan that sees a
+  fork head stops that repository's children.
+- **One process per personal repository.** A personal account has no
+  account-wide hook, so each registered repository runs its own forwarder.
 
 ## Remove
 
@@ -491,6 +846,10 @@ lie below `$HOME` (never `$HOME` or `~/.tartci` itself, in any letter case) and
 hold `state/dispatcher.json`, `app/current` or an exported commit
 (`app/<sha>/COMMIT`, which a failed first install leaves), and it checks this
 before stopping anything.
+
+`uninstall` stops any forwarder a crashed dispatcher left behind (recorded in
+`state/forwarders.json`, pid and start time both matching). GitHub removes
+the forwarders' hooks within seconds.
 
 `uninstall` reports (and does not delete) any pool VM or child still present:
 `tartci-owners-*` VMs, and `linux-ephr-<pid>-<n>` VMs whose `<pid>` is a child
@@ -510,8 +869,13 @@ that stays offline after about a day. To remove the goldens and config too:
 ```bash
 tart delete owners-macos; tart delete owners-linux
 rm ~/.config/tartci/owners.toml ~/.config/tartci/owners-vm-ed25519{,.pub}
+rm -r ~/.config/tartci/gh-webhooks             # the forwarder login (see step 3: not gh auth logout)
 ./tartci governor unset gate_guarantee_cores   # restore the role's gate reserve
 ```
+
+Deleting `gh-webhooks` does not revoke its token. GitHub lists it under the
+same "GitHub CLI" OAuth authorization as the main login, so revoking that
+authorization signs both logins out.
 
 ## Linux x64 lane
 
@@ -528,16 +892,16 @@ Each item is a separate PR into this fork's `main`, stacked in this order:
 | # | PR | Contents |
 | --- | --- | --- |
 | 1 | linux-rosetta | `TARTCI_LINUX_ROSETTA` in `providers/tart-linux/runner.sh`, the `owners-linux` golden, JIT config over ssh stdin, tests |
-| 2 | owners-dispatcher | `scripts/owners_dispatch.py`, `tartci owners <run\|dry-run\|status>`, polling discovery, tests |
+| 2 | owners-dispatcher | `scripts/owners_dispatch.py`, `tartci owners <run\|dry-run\|status>`, polling discovery (removed by D16), tests |
 | 3 | owners-service | `install` / `uninstall`, LaunchAgent template, reap pass, `owners-macos` golden, this guide |
-| 4 | owners-push | `gh webhook forward` supervision, localhost receiver, stale-hook cleanup, tests |
+| 4 | owners-push | `scripts/owners_push.py`: forwarder supervision, localhost receiver, stale-hook cleanup; event-driven discovery in the dispatcher; tests |
 
-PR 4 starts with a probe that runs every forwarder together for several
-hours, under a separate `gh` login holding only the webhook permissions (a
-fine-grained token with repository and organization webhook access if that
-works, otherwise a classic token with only `admin:repo_hook` and
-`admin:org_hook`), so the main login does not widen. If the probe fails, the
-pool keeps polling. Because PR 4 adds hook scopes and deletes hooks on
+PR 4 followed a probe that ran forwarders for several hours under the
+separate login. GitHub dropped each one after 1–2 hours (`close 1006`, exit
+1) and deleted its hook within 4 s of its process group ending. A new
+forwarder for a target whose hook still existed failed with 422, and
+SIGTERM to the `gh` parent alone left its child running. The supervisor's
+rules follow from these. Because PR 4 adds hook scopes and deletes hooks on
 GitHub, it is reviewed as a security change.
 
 Acceptance runs on this host: a smoke workflow in a private repository runs
@@ -554,7 +918,7 @@ and login.
 | D2 | serve private repositories only | in-VM fork hook, dispatch-only fork filter |
 | D3 | count only children not yet assigned a job | count all children, one child per job ID |
 | D4 | own multi-repository scan following `queue_scan.py`'s rules | label-only mode in `queue_scan.py` |
-| D5 | `gh webhook forward` push with reconcile polling | polling only, hot/cold tiers, App webhooks, scale-set listeners |
+| D5 | `gh webhook forward` push (refined by D15 and D16: no polling at all) | polling only, hot/cold tiers, App webhooks, scale-set listeners |
 | D6 | unique slot, name and lane ID per child | — |
 | D7 | lifecycle above (never exit with children running) | — |
 | D8 | admission and lock checks, pre-boot backoff, 120 s idle timeout, label subset of one lane, admin and fork-setting precheck, pinned commit | — |
@@ -564,6 +928,8 @@ and login.
 | D12 | macOS golden from Cirrus's base image (no Xcode); superseded by D24 | an Xcode image |
 | D13 | webhook forwarders use a separate, minimal-permission `gh` login | adding hook scopes to the main login |
 | D14 | release the static gate reserve (made optional by D23); child sizes 4 cores / 10240 MB (macOS), 3 cores / 8192 MB (Linux), fixed sizes replaced by D20 | keep the reserve with smaller VMs |
+| D15 | push events are hints for a targeted scan, never admission; one forwarder per organization owner and per registered personal repository, a personal account in `owners` refused; no interval polling (each forwarder rotated hourly, staggered, with a catch-up scan on every establish; local stall checks; REST hook checks every 30 minutes); `push = false` keeps polling (removed by D16) | reconcile polling, trusting event payloads, listing a personal account's repositories |
+| D16 | no polling at all: `push`, `reconcile_seconds` and `poll_seconds` removed (a config that sets one exits 2); owners re-listed only by a catch-up when the last listing is 15 min old, plus the event-driven partial listings; the fork-head guard runs on any `workflow_job` event of a repository with children and on catch-ups, never on a timer; the residual risk of a fork run queued during a forwarder gap in a repository whose fork-PR setting was enabled since its last listing is accepted (see [Limits](#limits)) | `push = false` polling, a timed re-listing (`reconcile_seconds`), a 10 s guard cadence for repositories with children |
 | D20 | child VM sizes are optional `owners.toml` keys per OS; an unset key leaves the lane's own sizing | sizes fixed in code (D14), a guard exemption for them |
 | D23 | a child VM size is a ceiling, not a reservation: the guest boots at it, but its lease (and waiter) charges at most `1/max_jobs` of the non-gate budget per axis, so `max_jobs` alone caps concurrency; gate leases are never discounted | charging the full size, so the sum of the sizes limits how many children run |
 | D24 | goldens carry GitHub's hosted-image toolset (see [Golden toolset](#golden-toolset)); macOS from Cirrus's Xcode image; Linux stays on Ubuntu 24.04 until Cirrus publishes 26.04 | baseline tools only, each job installing the rest |

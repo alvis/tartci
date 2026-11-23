@@ -12,9 +12,12 @@ The dispatcher decides *which repository and lane needs a runner next*. Everythi
 after that is tartci: lease admission, JIT registration, a throwaway VM, one job.
 GitHub assigns jobs by label; this never assigns or cancels one.
 
-Seams left for later changes: `Directory.refresh` / `Scanner.scan_repo` are the only
-GitHub readers, so a push receiver can mark repositories for an immediate scan by
-calling `Dispatcher.request_scan(repo)`.
+Discovery is event-driven only (scripts/owners_push.py): supervised `gh webhook forward`
+processes deliver `workflow_job` events, each a HINT that makes the dispatcher scan that one
+repository; each forwarder that comes up (or is rotated) gets one catch-up scan. Nothing is
+polled: an idle pool, and a pool whose VMs run, makes no scan between those triggers.
+`Directory.refresh` and `Scanner.scan_repo` are the only readers of what is served, and the
+scan decides.
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ import ctypes
 import dataclasses
 import datetime as dt
 import errno
+import fcntl
 import glob
 import json
 import os
@@ -60,8 +64,34 @@ LANES: Dict[str, Lane] = {
 }
 
 MACOS_HARD_MAX = 2  # Apple's two-guest limit; tartci enforces it again inside each child
-DISCOVERY_SECONDS = 900
+DISCOVERY_SECONDS = 900  # a catch-up re-lists every owner when the last full listing is this old
+ROTATE_DEFAULT_SECONDS = 3600  # planned forwarder restart (then a catch-up scan)
+DISCOVERY_MIN_GAP_SECONDS = 60.0  # no two event-triggered discoveries closer than this
+RETRY_MIN_SECONDS = 10.0  # a failed scan or listing is tried again after this, doubling...
+RETRY_MAX_SECONDS = 300.0  # ...up to this
+ADMISSION_RECHECK_SECONDS = 10.0  # closed admission with work waiting: a local re-check, no GitHub call
+# Keys a config may no longer set, and why (exit 2: a silently ignored key would hide the change).
+REMOVED_KEYS = {
+    "push": "push was removed: discovery is always push (webhook forwarders) and nothing is polled",
+    "reconcile_seconds": "reconcile_seconds was removed: owners are re-listed by the catch-up of each "
+                         "forwarder that comes up or is rotated (rotate_seconds), at most every 15 minutes",
+    "poll_seconds": "poll_seconds was removed: nothing is polled; scans follow webhook events, catch-ups and "
+                    "retries (a failed scan is retried after 10 s, doubling to 5 minutes)",
+}
+RUN_LOCK_FILE = "run.lock"  # under <root>/state: one `tartci owners run` per pool root
+RUN_LOCKED_EXIT = 3  # another `run` holds the lock (launchd's KeepAlive retries every ThrottleInterval)
+AUTH_DOWN_LOG_SECONDS = 600.0  # GitHub rejecting the dispatcher's own login (401) is logged at most this often
 ASSIGN_LAG_SECONDS = 15  # GitHub's job list can trail the runner's own "running job"
+# A hinted job (a lane's `queued` event) that a clean scan does not list yet is rescanned on this
+# ladder, then every last step, until HINT_WINDOW_SECONDS after its event. GitHub's run listings
+# trail the event: live, both runs of two `workflow_dispatch` jobs were missing at +17 s and +32 s,
+# the unfiltered listing had them about 2 min later while `?status=queued` still lacked one, and
+# list responses carry `Cache-Control: s-maxage=60` (a stale copy can be served for a minute).
+# Ten minutes is about five times that observed lag and costs at most six rescans of one
+# repository; a job still unlisted then is left to the next catch-up (each forwarder's hourly
+# rotation), as before.
+HINT_RECHECK_LADDER = (15, 30, 60, 120, 240)
+HINT_WINDOW_SECONDS = 600.0
 # A security drop also stops children whose assignment was OBSERVED within this long before the
 # drop was detected: such a child may have taken the very job that made the repository unsafe.
 # Our view of an assignment trails GitHub's: the runner polls its log every 5 s for "Running job:"
@@ -74,12 +104,12 @@ SUSTAINED_FAILURE_SECONDS = 180
 CHILD_TERM_GRACE_SECONDS = 150
 MAX_RATE_WAIT_SECONDS = 3600.0  # the longest Retry-After / reset wait honoured
 IDLE_EXIT_CODE = 124  # tartci's assignment (idle) timeout: no job was ever taken
+DEFERRED_EXIT_CODE = 75  # tartci deferred (pool lock, rate-limit backoff, admission) and retries later
 IDLE_BACKOFF_SECONDS = 30.0  # fixed and gentle: an idle-out is not a denial
 RETENTION_SECONDS = 7 * 86400  # ended children's state dirs and logs
 RETENTION_KEEP = 100  # ...and at most this many of the newest
 PRUNE_EVERY_SECONDS = 3600
 RATE_FLOOR_FRACTION = 0.02  # stop calling GitHub below this share of the limit
-RATE_WIDEN_BELOW = 0.25  # widen the poll interval below this headroom
 RUN_STATUSES = ("pending", "queued", "in_progress")  # runs whose jobs are scanned for work to serve
 # Runs whose head repository is checked: every run that is not finished. A fork's run waiting
 # for approval (action_required) or a gate (waiting, requested) is as much evidence that the
@@ -134,11 +164,14 @@ class Config:
     exclude_repos: List[str]
     max_jobs: int = 4
     max_macos: int = MACOS_HARD_MAX
-    poll_seconds: int = 10
-    reconcile_seconds: int = 60  # validated now; read by the push layer (a later change)
-    push: bool = True
     golden: Dict[str, str] = dataclasses.field(default_factory=dict)
     gh_cli: str = "gh"
+    forwarder_gh_config_dir: str = "~/.config/tartci/gh-webhooks"  # the forwarders' own gh login
+    forwarder_port: int = 0  # the 127.0.0.1 receiver's port; 0 picks a free one at each start
+    # restart each up forwarder this often (staggered per target), before GitHub drops it (measured
+    # after 1-2 h), then catch up once (which re-lists the owners when the last listing is 15 min
+    # old); 0 leaves it until it exits on its own, and then only its re-establish catches up
+    rotate_seconds: int = ROTATE_DEFAULT_SECONDS
     vm_size: Dict[str, int] = dataclasses.field(default_factory=dict)  # only the keys owners.toml sets
 
     def golden_for(self, lane: str) -> str:
@@ -184,16 +217,12 @@ def _int(data: Dict[str, Any], key: str, default: int, low: int, high: int) -> i
     return value
 
 
-def _bool(data: Dict[str, Any], key: str, default: bool) -> bool:
-    value = data.get(key, default)
-    if not isinstance(value, bool):  # "false" (a string) must not turn into True
-        raise ConfigError(f"{key} must be true or false")
-    return value
-
-
 def parse_config(data: Dict[str, Any]) -> Config:
-    known = {"owners", "repos", "exclude_repos", "max_jobs", "max_macos", "poll_seconds",
-             "reconcile_seconds", "push", "golden", "gh_cli"}
+    removed = [REMOVED_KEYS[key] for key in sorted(REMOVED_KEYS) if key in data]
+    if removed:
+        raise ConfigError("; ".join(removed) + ". Delete the line(s) from the config (docs/owner-pool.md)")
+    known = {"owners", "repos", "exclude_repos", "max_jobs", "max_macos", "golden", "gh_cli",
+             "forwarder_gh_config_dir", "forwarder_port", "rotate_seconds"}
     known.update(key for pairs in VM_SIZE_KEYS.values() for key, _ in pairs)
     unknown = sorted(set(data) - known)
     if unknown:
@@ -208,6 +237,12 @@ def parse_config(data: Dict[str, Any]) -> Config:
         if not isinstance(name, str) or not name or not re.match(r"^[A-Za-z0-9._:/@-]+$", name):
             raise ConfigError(f"[golden] {lane}: invalid golden name")
         golden[lane] = name
+    fwd_dir = data.get("forwarder_gh_config_dir", Config.forwarder_gh_config_dir)
+    if not isinstance(fwd_dir, str) or not fwd_dir.strip() or "\n" in fwd_dir:
+        raise ConfigError("forwarder_gh_config_dir must be a directory path")
+    rotate = data.get("rotate_seconds", ROTATE_DEFAULT_SECONDS)
+    if isinstance(rotate, bool) or not isinstance(rotate, int) or not (rotate == 0 or 600 <= rotate <= 86400):
+        raise ConfigError("rotate_seconds must be 0 (off) or an integer between 600 and 86400")
     vm_size: Dict[str, int] = {}
     for (cores_key, _), (mem_key, _) in VM_SIZE_KEYS.values():
         for key, (low, high) in ((cores_key, VM_CORES_RANGE), (mem_key, VM_MEM_MB_RANGE)):
@@ -219,11 +254,11 @@ def parse_config(data: Dict[str, Any]) -> Config:
         exclude_repos=_str_list(data, "exclude_repos", REPO_RE),
         max_jobs=_int(data, "max_jobs", 4, 1, 16),
         max_macos=_int(data, "max_macos", MACOS_HARD_MAX, 0, MACOS_HARD_MAX),
-        poll_seconds=_int(data, "poll_seconds", 10, 1, 3600),
-        reconcile_seconds=_int(data, "reconcile_seconds", 60, 1, 3600),
-        push=_bool(data, "push", True),
         golden=golden,
         gh_cli=str(data.get("gh_cli", "gh")),
+        forwarder_gh_config_dir=fwd_dir,
+        forwarder_port=_int(data, "forwarder_port", 0, 0, 65535),
+        rotate_seconds=rotate,
         vm_size=vm_size,
     )
     if not cfg.owners and not cfg.repos:
@@ -255,11 +290,14 @@ def load_config(path: str) -> Config:
 
 class GhError(Exception):
     def __init__(self, message: str, status: Optional[int] = None,
-                 rate_limited: bool = False, retry_after: float = 0.0) -> None:
+                 rate_limited: bool = False, retry_after: float = 0.0, permanent: bool = False) -> None:
         super().__init__(message)
         self.status = status
         self.rate_limited = rate_limited
         self.retry_after = retry_after
+        # our own verdict that retrying cannot help (a personal account, an unknown owner type...),
+        # though GitHub gave no 4xx for it
+        self.permanent = permanent
 
 
 @dataclasses.dataclass
@@ -283,22 +321,6 @@ class RateState:
 
     def floor(self) -> int:
         return max(25, int((self.limit or 0) * RATE_FLOOR_FRACTION))
-
-
-def adaptive_interval(base: float, rate: RateState, now: float) -> Tuple[float, str]:
-    """The next reconcile interval: `base` while headroom is healthy, wider below
-    25% of the limit, and a wait until the reset when the allowance is nearly spent
-    (back off before the limit, never into it)."""
-    if rate.remaining is None or not rate.limit:
-        return float(base), ""
-    if rate.remaining <= rate.floor():
-        wait = (rate.reset - now) if rate.reset else 60.0
-        return min(max(wait, float(base)), 900.0), "rate limit nearly spent; waiting for reset"
-    headroom = rate.headroom() or 1.0
-    if headroom < RATE_WIDEN_BELOW:
-        factor = max(2.0, RATE_WIDEN_BELOW / max(headroom, 0.02))
-        return min(base * factor, 300.0), f"rate headroom {headroom:.0%}; interval widened"
-    return float(base), ""
 
 
 _SPLIT = re.compile(r"\r?\n\r?\n")
@@ -435,7 +457,7 @@ class GhClient:
             items.extend(chunk)
             if len(chunk) < 100:
                 return items
-        raise GhError(f"listing {path} exceeds {max_pages} pages")
+        raise GhError(f"listing {path} exceeds {max_pages} pages", permanent=True)
 
 
 def _float(value: Optional[str], default: float) -> float:
@@ -461,6 +483,10 @@ class RepoSet:
     refused_security: set = dataclasses.field(default_factory=set)  # keys of `refused` that are security refusals
     errors: Dict[str, str] = dataclasses.field(default_factory=dict)  # owner/repo -> listing error
     rate_limited: set = dataclasses.field(default_factory=set)  # keys of `errors` caused by a rate limit
+    # keys of `errors` that may clear by themselves (no answer, a 5xx, a rate limit); the others
+    # (a 4xx such as a 403 for SAML SSO, a personal account) are retried far less often
+    transient: set = dataclasses.field(default_factory=set)
+    unauthorized: set = dataclasses.field(default_factory=set)  # keys of `errors` that were a 401
     retry_after: float = 0.0  # the longest wait GitHub asked for during this listing
     fetched_at: float = 0.0
 
@@ -493,6 +519,8 @@ def refusal_reason(repo: Dict[str, Any], need_admin: bool = True) -> Optional[st
 
 def _transient(error: GhError) -> bool:
     """A failure that says nothing about the repository itself: rate limit, outage, timeout."""
+    if error.permanent:
+        return False
     return error.rate_limited or error.status is None or error.status == 0 or error.status >= 500
 
 
@@ -504,29 +532,19 @@ class Directory:
         self.client = client
         self.cfg = cfg
         self.current = RepoSet()
-        self._me: Optional[str] = None
-
-    def me(self) -> str:
-        if self._me is None:
-            body = self.client.get("user").body
-            login = body.get("login") if isinstance(body, dict) else None
-            if not login:
-                raise GhError("cannot determine the authenticated GitHub login")
-            self._me = str(login)
-        return self._me
 
     def _owner_repos(self, owner: str) -> List[Dict[str, Any]]:
+        """The private repositories of an organization. A personal account in `owners` is never
+        listed (its repositories are registered one by one in `repos`, one forwarder each):
+        `check_owner_types` refuses it at startup, this catches a late answer."""
         info = self.client.get(f"users/{owner}").body
         kind = info.get("type") if isinstance(info, dict) else None
         if kind == "Organization":
             return self.client.pages(f"orgs/{owner}/repos?type=private")
         if kind == "User":
-            if owner.lower() != self.me().lower():
-                raise GhError(f"private repositories of user {owner} are not listable by {self.me()}")
-            listing = self.client.pages("user/repos?affiliation=owner&visibility=private")
-            return [r for r in listing
-                    if str((r.get("owner") or {}).get("login", "")).lower() == owner.lower()]
-        raise GhError(f"unknown owner type for {owner}")
+            raise GhError(f"{owner} is a personal account: list its private repositories in `repos` "
+                          "instead (one forwarder each)", permanent=True)
+        raise GhError(f"unknown owner type for {owner}", permanent=True)
 
     def _fork_setting_ok(self, full: str) -> Optional[str]:
         """None when "Run workflows from fork pull requests" is off, else why not.
@@ -541,6 +559,10 @@ class Directory:
     @staticmethod
     def _note_error(new: RepoSet, key: str, error: GhError) -> None:
         new.errors[key] = str(error)
+        if _transient(error):
+            new.transient.add(key)
+        if error.status == 401:
+            new.unauthorized.add(key)
         if error.rate_limited:
             new.rate_limited.add(key)
             new.retry_after = max(new.retry_after, error.retry_after or 60.0)
@@ -553,15 +575,38 @@ class Directory:
         self.current.refused[full] = reason
         (self.current.refused_security.add if security else self.current.refused_security.discard)(full)
 
-    def refresh(self) -> RepoSet:
-        """Re-list everything. An owner whose listing fails keeps its previous
-        entries (visibility is rechecked on every scan anyway) and is named in
-        `errors`; it is never treated as an empty owner."""
+    def refresh(self, only: Optional[Iterable[str]] = None) -> RepoSet:
+        """Re-list everything, or with `only` just those owners and repositories (the keys of a
+        failed listing's `errors`, a repository that answered 404): everything else is kept as
+        it was. An owner whose listing fails keeps its previous entries (visibility is rechecked
+        on every scan anyway) and is named in `errors`; it is never treated as an empty owner."""
         previous = self.current
         new = RepoSet(fetched_at=time.time())
         excluded = {name.lower() for name in self.cfg.exclude_repos}
         candidates: Dict[str, Dict[str, Any]] = {}
-        for owner in self.cfg.owners:
+        owners, singles = list(self.cfg.owners), list(self.cfg.repos)
+        if only is not None:
+            scope = {str(key).lower() for key in only}
+            owners = [owner for owner in owners if owner.lower() in scope]
+            listed = {owner.lower() for owner in owners}
+            singles = sorted({str(key) for key in only if "/" in str(key)}
+                             | {full for full in singles if full.split("/")[0].lower() in listed})
+
+            def kept(name: str) -> bool:
+                return name.lower() not in scope and name.split("/")[0].lower() not in listed
+
+            new.served = {full: repo for full, repo in previous.served.items() if kept(full)}
+            new.refused = {full: why for full, why in previous.refused.items() if kept(full)}
+            new.refused_security = {full for full in previous.refused_security if kept(full)}
+            for key, error in previous.errors.items():
+                if kept(key):
+                    new.errors[key] = error
+                    for mine, theirs in ((new.rate_limited, previous.rate_limited),
+                                         (new.transient, previous.transient),
+                                         (new.unauthorized, previous.unauthorized)):
+                        if key in theirs:
+                            mine.add(key)
+        for owner in owners:
             try:
                 for item in self._owner_repos(owner):
                     candidates[str(item.get("full_name", "")).lower()] = item
@@ -570,7 +615,7 @@ class Directory:
                 for full, repo in previous.served.items():
                     if repo.owner.lower() == owner.lower():
                         new.served[full] = repo
-        for full in self.cfg.repos:
+        for full in singles:
             if full.lower() in candidates:
                 continue
             try:
@@ -634,6 +679,7 @@ class RepoScan:
     jobs: List[QueuedJob] = dataclasses.field(default_factory=list)  # served: one lane each
     skipped: List[QueuedJob] = dataclasses.field(default_factory=list)  # queued, labels not served
     error: Optional[str] = None  # a failed scan is an error, never "0 queued"
+    status: Optional[int] = None  # the HTTP status of `error` (None: no HTTP answer, or not a GitHub error)
     rate_limited: bool = False  # `error` is a GitHub rate limit, not unreachability
     retry_after: float = 0.0  # seconds GitHub asked us to wait
     dropped: Optional[str] = None  # repository no longer eligible (turned public, fork-headed run, archived...)
@@ -700,6 +746,13 @@ class Scanner:
                 break
         return jobs
 
+    def forget(self, full: str) -> None:
+        """Drop the repository's cached job lists, so its next scan reads every run's jobs fresh
+        (a hinted job's recheck: a run's job list can trail the event as its runs listing does)."""
+        with self._lock:
+            for key in [k for k in self._clean_jobs if k[0] == full]:
+                del self._clean_jobs[key]
+
     def _prune(self, full: str, active: set) -> None:
         """Forget cached job lists of runs that are no longer active."""
         with self._lock:
@@ -717,8 +770,9 @@ class Scanner:
             return cached[1]
         jobs = self._list_jobs(full, run_id)
         # Only a run with nothing waiting is safe to reuse: a queued job's status
-        # must be read fresh every scan.
-        if not any(str(j.get("status", "")).lower() in ("queued", "waiting", "pending") for j in jobs):
+        # must be read fresh every scan. An active run that lists no job at all is
+        # GitHub's job list trailing the run, not a run with nothing to serve.
+        if jobs and not any(str(j.get("status", "")).lower() in ("queued", "waiting", "pending") for j in jobs):
             with self._lock:
                 self._clean_jobs[(full, run_id)] = (stamp, jobs)
         return jobs
@@ -801,6 +855,7 @@ class Scanner:
             self._check_runs(full, result)  # a fork run's reason replaces the visibility one
         except GhError as error:
             result.error = str(error)
+            result.status = error.status
             result.rate_limited = error.rate_limited
             result.retry_after = error.retry_after
         except Exception as error:
@@ -821,7 +876,13 @@ class Scanner:
             if runs is None:
                 return result
             for run in runs:
-                for job in self._jobs(full, run):
+                try:
+                    run_jobs = self._jobs(full, run)
+                except GhError as error:
+                    if error.status == 404:
+                        continue  # the run was deleted after the runs were listed: it has nothing queued
+                    raise
+                for job in run_jobs:
                     if str(job.get("status", "")).lower() != "queued":
                         continue
                     labels = tuple(str(label).lower() for label in (job.get("labels") or []) if str(label))
@@ -833,6 +894,7 @@ class Scanner:
                     (result.jobs if queued.lane else result.skipped).append(queued)
         except GhError as error:
             result.error = str(error)
+            result.status = error.status
             result.rate_limited = error.rate_limited
             result.retry_after = error.retry_after
             result.jobs, result.skipped = [], []
@@ -1210,8 +1272,10 @@ class Scheduler:
         self.base_env = dict(os.environ if base_env is None else base_env)
         self.children: Dict[str, Child] = {}
         self.stopping = False
+        self.terminated = False  # terminate_all() has signalled every child
         self.refusals: Dict[Tuple[str, str], int] = collections.defaultdict(int)
         self.backoff_until: Dict[Tuple[str, str], float] = {}
+        self.admission_closed = False  # the last plan found tartci's admission closed
         self._counter = 0
         macos_cap = cfg.max_macos
         try:
@@ -1240,8 +1304,12 @@ class Scheduler:
         that pair's children that are not yet assigned a job. Caps and denial
         backoff apply here; tartci's admission, lease store and macOS cap stay
         authoritative inside each child."""
-        if self.stopping or not jobs or not self.admission():
+        if self.stopping or not jobs:
             return []
+        if not self.admission():
+            self.admission_closed = True
+            return []
+        self.admission_closed = False
         by_pair: Dict[Tuple[str, str], List[QueuedJob]] = collections.defaultdict(list)
         for job in jobs:
             if job.lane:
@@ -1345,11 +1413,11 @@ class Scheduler:
             if code is not None:
                 finished.append((child, int(code)))
                 del self.children[name]
-                self._mark_ended(child)
+                self._mark_ended(child, int(code))
                 self._account_exit(child, int(code))
         return finished
 
-    def _mark_ended(self, child: Child) -> None:
+    def _mark_ended(self, child: Child, code: int) -> None:
         """Retire the child's identity record: the dir stays (retention removes it), but
         with no pid it can never be adopted, nor its pid mistaken for a live child."""
         path = os.path.join(child.state_dir, CHILD_META)
@@ -1358,7 +1426,10 @@ class Scheduler:
             return
         meta.pop("pid", None)
         meta.pop("pid_started", None)
-        meta.update({"ended": True, "ended_at": self.clock()})
+        # `clean`: this exit cannot have left a registration, so a restart need not reap for it.
+        # An adopted child's exit status cannot be read (AdoptedProc.poll reports 0): rc unknown.
+        meta.update({"ended": True, "ended_at": self.clock(), "rc": None if child.adopted else code,
+                     "clean": leaves_no_registration(child, code)})
         try:
             write_private_json(path, meta)
         except OSError:
@@ -1482,12 +1553,19 @@ class Scheduler:
                 f"assigned={child.assigned_at is not None}")
         return adopted
 
+    def terminate_all(self) -> None:
+        """SIGTERM every child once, without waiting: each starts deleting its VM and
+        registration at once. A second TERM could interrupt that cleanup, so never resend."""
+        if self.terminated:
+            return
+        self.stopping = self.terminated = True
+        for child in self.children.values():
+            _signal(child.proc, signal.SIGTERM)
+
     def shutdown(self, grace: float = CHILD_TERM_GRACE_SECONDS) -> None:
         """SIGTERM every child, give them `grace` seconds to delete their VMs, then
         SIGKILL what is left, by process group so `tart run` and `ssh` go too."""
-        self.stopping = True
-        for child in self.children.values():
-            _signal(child.proc, signal.SIGTERM)
+        self.terminate_all()
         deadline = self.clock() + grace
         while self.children and self.clock() < deadline:
             self.observe()
@@ -1856,6 +1934,25 @@ def prune_children(root: str, live: Iterable[str], now: float, max_age: float = 
     return removed
 
 
+def recent_child_repos(root: str, now: float, window: float) -> Dict[str, float]:
+    """Repositories of the pool's children whose state dirs changed within `window`: the reap
+    candidates after a restart, since a previous process's children may have crashed. A child
+    recorded as ended cleanly (`clean`, see `leaves_no_registration`) is skipped."""
+    found: Dict[str, float] = {}
+    for path in glob.glob(os.path.join(root, "state", CHILD_PREFIX + "*", CHILD_META)):
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        meta = read_json(path)
+        if isinstance(meta, dict) and meta.get("ended") and meta.get("clean") is True:
+            continue
+        repo = str(meta.get("repo") or "") if isinstance(meta, dict) else ""
+        if repo and REPO_RE.match(repo) and now - mtime < window:
+            found[repo] = max(found.get(repo, 0.0), mtime)
+    return found
+
+
 def tart_runner(argv: List[str]) -> str:
     env = scrub_env(dict(os.environ))  # PATH, HOME...: what the children have, no tokens
     env["TART_HOME"] = os.path.join(os.path.expanduser("~"), ".tart")  # not an inherited TART_HOME, as child_env
@@ -1868,13 +1965,14 @@ def tart_runner(argv: List[str]) -> str:
 # The runner names the pool's own children register under: a macOS child's VM and runner are
 # `tartci-owners-<lane><n>-<pid>-<k>`, a Linux child's are `linux-ephr-<pid>-<k>`.
 REAP_PREFIXES = "tartci-owners-,linux-ephr-"
-REAP_EVERY_SECONDS = 90.0  # one repository per pass: 94 repositories are all visited in ~2.4 h
+REAP_EVERY_SECONDS = 90.0  # one candidate repository per pass (REAP_CANDIDATE_SECONDS)
 REAP_FIRST_DELAY_SECONDS = 30.0  # after startup, so adoption and the first scans come first
 REAP_TIMEOUT_SECONDS = 180.0  # a pass that runs longer is killed (vm_reap bounds itself to ~60 s)
 REAP_SCOPES = "repository"  # the only scope the pool registers runners at (never organization)
 REAP_MIN_OFFLINE_SECONDS = 900  # vm_reap's own defaults, passed explicitly so no environment moves them
 REAP_MIN_OFFLINE_PASSES = 3
-REAP_MIN_HEADROOM = RATE_WIDEN_BELOW  # no pass while the shared API allowance is below this share
+REAP_MIN_HEADROOM = 0.25  # no pass while the shared API allowance is below this share
+REAP_CANDIDATE_SECONDS = 3 * 3600.0  # how long a repository is visited after a child of it ended badly
 
 
 class ReapPass:
@@ -2075,9 +2173,37 @@ def git_commit(tartci_root: str) -> str:
         return "unknown"
 
 
+@dataclasses.dataclass
+class Hint:
+    """A lane's `queued` event for a served repository, kept until a clean scan lists its job,
+    a direct read finds it no longer queued (or answers 404 at a second recheck), or
+    HINT_WINDOW_SECONDS pass."""
+    seen_at: float  # when the event arrived
+    misses: int = 0  # clean scans, at or after `due`, that did not list the job
+    due: float = 0.0  # the next recheck (0.0: the event's own scan has not run yet)
+    not_found_due: float = 0.0  # the recheck whose direct read first answered 404 (0.0: none yet)
+
+
 def log_line(message: str) -> None:
     stamp = dt.datetime.now().strftime("%H:%M:%S")
     print(f"[owners {stamp}] {message}", flush=True)
+
+
+def deferred_untouched(child: "Child", code: int) -> bool:
+    """A child that deferred (exit 75) before it wrote any state: both providers write their
+    first heartbeat (with the VM) before minting a JIT config, so it registered nothing and
+    no reap pass is needed for it (ACC01: a sibling's pool-lock hold cost 3 h of passes)."""
+    return code == DEFERRED_EXIT_CODE and not child.phase and not child.vm_seen \
+        and child.assigned_at is None
+
+
+def leaves_no_registration(child: "Child", code: int) -> bool:
+    """An exit that cannot have left a runner registration behind: a served job or an idle-out
+    (the runner removed itself), or a deferral before any state. Any other exit, and every exit
+    of an adopted child, whose real status is unknown, makes its repository a reap candidate."""
+    if child.adopted:
+        return False
+    return code in (0, IDLE_EXIT_CODE) or deferred_untouched(child, code)
 
 
 class Dispatcher:
@@ -2088,8 +2214,12 @@ class Dispatcher:
                  tart: Callable[[List[str]], Any] = tart_runner,
                  alive: Optional[Callable[..., bool]] = None,
                  born: Optional[Callable[[str], Optional[float]]] = None,
-                 reaper: Optional["ReapPass"] = None) -> None:
+                 reaper: Optional["ReapPass"] = None, *,
+                 push: Any) -> None:
         self.reaper = reaper
+        # The push supervisor (owners_push.Supervisor): the only source of scans besides local
+        # triggers (a freed slot, a backoff's end, a retry). Nothing is polled.
+        self.push = push
         self.cfg, self.root, self.tartci_root = cfg, root, tartci_root
         self.client, self.sched, self.scanner, self.directory = client, scheduler, scanner, directory
         self.clock, self.sleep, self.tart, self.born = clock, sleep, tart, born
@@ -2099,8 +2229,7 @@ class Dispatcher:
         self.adopt_alive = alive or same_process
         self.commit = git_commit(tartci_root)
         self.started_at = clock()
-        self.next_scan = 0.0
-        self.rate_block_until = 0.0  # GitHub's Retry-After: no scan before this, push hint or not
+        self.rate_block_until = 0.0  # GitHub's Retry-After: no scan before this, whatever asked for it
         self.last_discovery = 0.0
         self.last_prune = 0.0
         self.error_since: Optional[float] = None
@@ -2108,16 +2237,53 @@ class Dispatcher:
         self.last_guards: Dict[str, RepoScan] = {}  # fork-head guard readings of unserved repositories with children
         # repository -> when a SECURITY refusal/drop of it was first detected; kept while it has children
         self._holds: Dict[str, float] = {}
-        self.interval_note = ""
         self.exit_code: Optional[int] = None
         self.tick_errors = 0
-        self._requested: set = set()
+        self._requested: set = set()  # repositories a queued lane event asked to scan (hints)
+        # The fork-head guard is event-driven: a `workflow_job` event of any action and labels for a
+        # repository with live children asks for its scan (served: the full scan, which checks the run
+        # heads first; not served: the guard alone). A catch-up covers it too. There is no timer.
+        self._guard: set = set()
+        self._guard_failures = 0  # guard readings of unserved repositories that failed in a row...
+        self._guard_retry_at: Optional[float] = None  # ...and when they are read again (the retry ladder)
         self._stop_signal: Optional[int] = None
-
-    # seam for the push receiver (a later change): scan this repository now
-    def request_scan(self, repo: str) -> None:
-        self._requested.add(repo)
-        self.next_scan = 0.0
+        self._catchup: Dict[str, Any] = {}  # target key -> Target whose forwarder just came up
+        self._unknown: set = set()  # event repositories of an org target not (yet) in the directory
+        self._last_unknown_refresh = 0.0
+        # repository -> not-before time of a rescan for queued jobs left unserved by the last plan:
+        # 0.0 waits for a freed slot or reopened admission, a time is a (repo, lane) backoff's end
+        self._backlog: Dict[str, float] = {}
+        self._capacity_freed = False
+        self._admission_recheck_at = 0.0
+        # repository -> not-before time of a rescan after its scan failed (a hint, catch-up or backlog
+        # scan that errored is never dropped), and how many scans of it failed in a row
+        self._retry: Dict[str, float] = {}
+        self._retry_count: Dict[str, int] = collections.Counter()
+        self._failed_repos: set = set()  # repositories whose scans failed since GitHub last answered
+        self._push_failures = 0  # cycles in a row that raised
+        self._push_retry_at = 0.0
+        # catch-ups whose target's listing failed (its repositories are not all known): they run
+        # again once that listing succeeds
+        self._catchup_waiting: Dict[str, Any] = {}
+        self._listing_failures = 0
+        self._listing_retry_at = 0.0  # the next retry of listings that failed transiently (no answer, 5xx, rate limit)
+        # repository -> when to list it again after a scan of it answered 404 (once soon, so a passing
+        # 404 costs about a minute); `_notfound_relisted` remembers that it was done, until the next
+        # full listing (a repository that keeps answering 404 waits for that)
+        self._relist_at: Dict[str, float] = {}
+        self._notfound_relisted: set = set()
+        self._auth_down_logged_at: Optional[float] = None
+        # repository -> hinted job id -> its Hint; a clean scan that does not list the job rescans
+        # the repository on HINT_RECHECK_LADDER (the run listings can trail the event), and
+        # `_recheck` holds each repository's earliest due recheck
+        self._hinted: Dict[str, Dict[int, Hint]] = {}
+        self._recheck: Dict[str, float] = {}
+        self.hint_outcomes: Dict[str, int] = collections.Counter()  # listed, taken, gone, expired, dropped
+        self.scan_times: Dict[str, float] = {}  # when each `last_scans` reading was taken
+        self._reap_candidates: Dict[str, float] = {}  # repository -> when a child of it ended badly
+        self.scan_counts: Dict[str, int] = collections.Counter()  # why scans ran
+        self.events_seen: Dict[str, int] = collections.Counter()
+        self.last_scan_at = 0.0
 
     def request_stop(self, signum: int) -> None:
         """Signal handler: stop admitting at once (a scan already in flight must not
@@ -2179,7 +2345,9 @@ class Dispatcher:
             for name in self.sched.stop_children(full, runners=scan.fork_runners):
                 log_line(f"stopping {name}: it holds a job of a fork-headed run of {full}")
         if scan.fork_pending:
-            log_line(f"a fork-headed job of {full} is still queued: reading it again next cycle")
+            # Every waiting child of `full` was just stopped, and a busy one cannot take a second
+            # job, so none of ours can take it; its next event (it gets a runner) is read again.
+            log_line(f"a fork-headed job of {full} is still queued: guarding it again on its next event")
 
     def _owner_listing_failed(self, repo: str) -> bool:
         """The listing of `repo`'s owner (or of `repo` itself) failed in the latest discovery."""
@@ -2226,39 +2394,72 @@ class Dispatcher:
             self._security_stop(full, scan)
 
     # -- one scan cycle
-    def scan_cycle(self) -> None:
+    def scan_cycle(self, select: Optional[Callable[[], Iterable[str]]] = None,
+                   discover: Optional[bool] = None, only: Optional[Iterable[str]] = None) -> Dict[str, RepoScan]:
+        """Discover when asked (by default: when the last full listing is DISCOVERY_SECONDS old),
+        scan, guard, start children. `select` (called after any discovery, so a catch-up sees new
+        repositories) names the few repositories to scan (default: every served one); `only` makes
+        the discovery re-list just those owners and repositories (it then does not count as the
+        full listing). Every unserved repository with children is guarded in every cycle."""
         started = self.clock()
+        self.last_scan_at = started
         rate_wait = 0.0
         listing_hard = False
-        if started - self.last_discovery >= DISCOVERY_SECONDS or not self.directory.current.fetched_at:
-            current = self.directory.refresh()
-            self.last_discovery = started
+        if discover is None:
+            discover = started - self.last_discovery >= DISCOVERY_SECONDS or not self.directory.current.fetched_at
+        if discover:
+            if only is None:
+                current = self.directory.refresh()
+                self.last_discovery = started
+                # A full listing settles every earlier 404 (the scans of this cycle run after it, so
+                # each pending re-list is older): a repository that answers 404 again, in this very
+                # cycle too, may be re-listed soon once more.
+                self._notfound_relisted = set()
+            else:
+                current = self.directory.refresh(only=only)
             for owner, error in current.errors.items():
                 log_line(f"ERR listing {owner}: {error}")
             rate_wait = max(rate_wait, current.retry_after)
             listing_hard = bool(set(current.errors) - current.rate_limited)
             self._stop_unserved()
-        repos = sorted(self.directory.current.served)
+        served = self.directory.current.served
+        if select is None:
+            repos = sorted(served)
+        else:
+            lookup = {name.lower(): name for name in served}
+            repos = sorted({lookup[name.lower()] for name in select() if name.lower() in lookup})
         scans = scan_all(self.scanner, repos)
-        self.last_scans = scans
+        # keep the newest reading of each served repository for `status`, and when it was taken
+        self.last_scans = {full: scan for full, scan in self.last_scans.items() if full in served}
+        self.last_scans.update(scans)
+        self.scan_times = {full: at for full, at in self.scan_times.items() if full in self.last_scans}
+        self.scan_times.update({full: started for full in scans})
         jobs: List[QueuedJob] = []
-        hard = limited = 0
         for full, scan in scans.items():
             if scan.dropped:
                 self._drop(full, scan)
+            elif scan.error and scan.status == 404:
+                # The repository or its runs answered 404 (deleted, renamed, no longer readable, or a
+                # passing glitch). GitHub answered, so it is no outage. It is not served (its children
+                # expire, the guard watches them) until it is listed again: once soon, then (it keeps
+                # answering 404) at the next full listing.
+                self.directory.drop(full, f"not found when scanned ({scan.error})", security=False)
+                if self._relist_soon(full, started):
+                    log_line(f"ERR scanning {full}: {scan.error}; not served until it is listed again "
+                             f"in {DISCOVERY_MIN_GAP_SECONDS:.0f}s")
+                else:
+                    log_line(f"ERR scanning {full}: {scan.error} (again); not served until the next listing")
             elif scan.error:
                 if scan.rate_limited:
-                    limited += 1
                     rate_wait = max(rate_wait, scan.retry_after or 60.0)
-                else:
-                    hard += 1
                 log_line(f"ERR scanning {full}: {scan.error}")
             else:
                 jobs.extend(scan.jobs)
+        self._note_login(scans, discover)
         # The fork-head guard: a repository that is not served (refused or dropped, for any
-        # reason, or simply unknown after a failed listing) but still has children keeps being
-        # checked for a fork-headed run every cycle, until its children are gone. A security
-        # refusal that came first, or a drop for another reason, must not end the guard.
+        # reason, or simply unknown after a failed listing) but still has children is checked for
+        # a fork-headed run in every cycle, until its children are gone. A security refusal that
+        # came first, or a drop for another reason, must not end the guard.
         guarded = sorted({c.repo for c in self.sched.children.values() if not c.terminating}
                          - set(self.directory.current.served)
                          - {full for full, scan in scans.items() if scan.runs_checked})
@@ -2267,16 +2468,12 @@ class Dispatcher:
             if guard.error and guard.rate_limited:
                 rate_wait = max(rate_wait, guard.retry_after or 60.0)
             self._guard_unserved(full, guard)
+        self._note_guard_retry()
         with_children = {c.repo for c in self.sched.children.values()}
         for full in [repo for repo in self._holds if repo in self.directory.current.served or repo not in with_children]:
             del self._holds[full]
-        # Unreachable means nothing could be read for a reason other than a rate limit:
-        # a 403 with Retry-After proves GitHub is up, so it never feeds the exit-75 rule.
-        unreachable = (hard > 0 and hard + limited == len(repos)) or (listing_hard and not repos)
-        if unreachable:
-            self.error_since = self.error_since or started
-        else:
-            self.error_since = None
+        self._reachability(scans, discover and not listing_hard, listing_hard)
+        self._note_retries(scans)
         self._check_sustained()
         if self._stop_signal is None:
             for repo, lane in self.sched.plan(jobs, started):
@@ -2288,21 +2485,434 @@ class Dispatcher:
                     continue
                 log_line(f"start {child.name} lane={lane} repo={repo} "
                          f"({len(self.sched.children)}/{self.cfg.max_jobs} children)")
-        interval, note = adaptive_interval(self.cfg.poll_seconds, self.client.rate, self.clock())
+        self._note_backlog(scans, jobs, started)
         if rate_wait > 0:
             rate_wait = min(rate_wait, MAX_RATE_WAIT_SECONDS)
             self.rate_block_until = self.clock() + rate_wait
-            if rate_wait > interval:
-                interval, note = rate_wait, f"GitHub asked us to wait {rate_wait:.0f}s; next scan delayed"
-        self.interval_note = note
-        if note:
-            log_line(note)
-        self.next_scan = self.clock() + interval
+            log_line(f"GitHub asked us to wait {rate_wait:.0f}s; every scan waits until then (nothing is dropped)")
+        return scans
 
-    def _scan_due(self) -> bool:
+    def _note_guard_retry(self) -> None:
+        """A guard reading of an unserved repository with children that failed is read again on
+        the retry ladder (10 s doubling to 5 min) while the children live, since no event may
+        come; one clean round of guard readings ends it."""
+        if any(guard.error for guard in self.last_guards.values()):
+            self._guard_failures += 1
+            self._guard_retry_at = self.clock() + self._retry_delay(self._guard_failures)
+        elif self.last_guards or not self._unserved_with_children():
+            self._guard_failures, self._guard_retry_at = 0, None
+
+    def _unserved_with_children(self) -> set:
+        served = {name.lower() for name in self.directory.current.served}
+        return {c.repo for c in self.sched.children.values() if not c.terminating and c.repo.lower() not in served}
+
+    def _relist_soon(self, full: str, now: float) -> bool:
+        """Arrange for `full`, unserved after a 404, to be listed again after
+        DISCOVERY_MIN_GAP_SECONDS, unless that was already done since the last full listing."""
+        if full in self._notfound_relisted:
+            return False
+        self._notfound_relisted.add(full)
+        self._relist_at[full] = now + DISCOVERY_MIN_GAP_SECONDS
+        return True
+
+    def _note_login(self, scans: Dict[str, RepoScan], discover: bool) -> None:
+        """GitHub rejecting the dispatcher's own login (HTTP 401 on every scan of the cycle, or on a
+        listing) is logged loudly, at most every AUTH_DOWN_LOG_SECONDS; a clean scan ends it."""
+        rejected = bool(scans) and all(scan.status == 401 for scan in scans.values())
+        if rejected or (discover and self.directory.current.unauthorized):
+            self._log_login_rejected()
+        elif any(not scan.error for scan in scans.values()):
+            self._auth_down_logged_at = None  # the login works: a later rejection is logged at once
+
+    def _log_login_rejected(self) -> None:
+        """A revoked, expired or logged-out main login. A restart cannot fix it, so it never
+        counts toward exit 75 (the forwarders stay up and serving resumes with the next
+        scan once `gh auth login` is redone); it is logged as DOWN instead."""
         now = self.clock()
-        return now >= self.next_scan and now >= self.rate_block_until \
-            and not (self.sched.stopping and self.exit_code is None)
+        if self._auth_down_logged_at is not None and now - self._auth_down_logged_at < AUTH_DOWN_LOG_SECONDS:
+            return
+        self._auth_down_logged_at = now
+        log_line("ERR GitHub rejects the dispatcher's login (HTTP 401): the pool is DOWN, NOTHING is served "
+                 "and no child can mint a runner until `gh auth login` is redone for this user "
+                 "(check with `gh auth status`)")
+
+    @staticmethod
+    def _outage_like(scan: RepoScan) -> bool:
+        """A failure that may mean GitHub (or the network) is down: no HTTP answer, or a 5xx.
+        A 4xx or a rate limit is GitHub answering."""
+        return bool(scan.error) and not scan.rate_limited and not scan.dropped \
+            and (not scan.status or scan.status >= 500)
+
+    def _github_down(self) -> bool:
+        """Confirm an outage before it counts toward exit 75, with `GET rate_limit` (it
+        costs nothing against the limit). Any answer below 500, a rate limit included, means
+        GitHub is up and the failures are the repositories' own."""
+        try:
+            self.client.get("rate_limit")
+        except GhError as error:
+            if error.status == 401:
+                self._log_login_rejected()
+            return not error.rate_limited and (not error.status or error.status >= 500)
+        except Exception:
+            return True
+        return False
+
+    def _reachability(self, scans: Dict[str, RepoScan], listed: bool, listing_hard: bool) -> None:
+        """The exit-75 evidence. A cycle scans a few repositories at a time, so one repository
+        whose endpoint keeps failing must not read as "GitHub unreachable". Any answer from GitHub
+        (a clean scan, a 4xx, a listing, a rate limit) clears it. Only failures with no HTTP
+        answer or a 5xx count, and only once scans of two distinct repositories failed in a row
+        (across cycles), or every served repository's did, or a listing failed too (or failed
+        with nothing served); even then `GET rate_limit` must fail too before it counts."""
+        failed = {full.lower() for full, scan in scans.items() if self._outage_like(scan)}
+        answered = any(not self._outage_like(scan) for scan in scans.values())
+        if answered or listed:
+            self.error_since = None
+            self._failed_repos.clear()
+            return
+        if not failed and not listing_hard:
+            return  # nothing was read: no evidence either way
+        self._failed_repos |= failed
+        served = {name.lower() for name in self.directory.current.served}
+        if len(self._failed_repos) >= 2 or (served and served <= self._failed_repos) \
+                or (listing_hard and (failed or not served)):
+            if self._github_down():
+                self.error_since = self.error_since or self.clock()
+            else:  # GitHub answers: those repositories fail on their own (retried on the ladder)
+                self.error_since = None
+                self._failed_repos.clear()
+
+    def _retry_delay(self, failures: int) -> float:
+        return float(min(RETRY_MAX_SECONDS, RETRY_MIN_SECONDS * (2 ** max(0, failures - 1))))
+
+    def _note_retries(self, scans: Dict[str, RepoScan]) -> None:
+        """A repository whose scan failed (5xx, a timeout, a rate limit) is scanned again
+        after a growing delay, so the hint, catch-up or backlog entry that asked for it is never
+        lost, and a failing repository is never rescanned every tick."""
+        now = self.clock()
+        for full, scan in scans.items():
+            if scan.error and not scan.dropped:
+                self._retry_count[full] += 1
+                self._retry[full] = now + self._retry_delay(self._retry_count[full])
+            else:
+                self._retry.pop(full, None)
+                self._retry_count.pop(full, None)
+
+    def _note_backlog(self, scans: Dict[str, RepoScan], jobs: List[QueuedJob], started: float) -> None:
+        """Remember the scanned repositories whose queued jobs the plan could not cover (caps full,
+        admission closed, a pair backing off), so they are rescanned when that changes rather
+        than on a timer. A repository read cleanly with nothing left over leaves the backlog."""
+        wanted: Dict[Tuple[str, str], int] = collections.Counter((job.repo, str(job.lane)) for job in jobs if job.lane)
+        covering: Dict[Tuple[str, str], int] = collections.Counter(
+            child.pair for child in self.sched.children.values() if child.covers(started))
+        for full, scan in scans.items():
+            if scan.error:
+                if full in self._backlog and full in self._retry:
+                    self._backlog[full] = self._retry[full]  # kept, and not due again before the retry
+                continue
+            short = [pair for pair, count in wanted.items() if pair[0] == full and count > covering[pair]]
+            if not short or scan.dropped:
+                self._backlog.pop(full, None)
+                continue
+            ends = [self.sched.backoff_until.get(pair, 0.0) for pair in short]
+            backed_off = all(end > started for end in ends)
+            self._backlog[full] = min(ends) if backed_off else 0.0
+
+    def _backlog_due(self, now: float) -> set:
+        """Backlog repositories worth a rescan now: after a child exited (a slot may be free) or
+        admission reopened, all of them that are not waiting out a backoff or a failed scan's
+        retry; and those whose backoff or retry just ended."""
+        if not self._backlog:
+            self._capacity_freed = False
+            return set()
+        due = {full for full, until in self._backlog.items() if 0.0 < until <= now}
+        freed = self._capacity_freed and len(self.sched.children) < self.cfg.max_jobs
+        if not freed and self.sched.admission_closed and now >= self._admission_recheck_at:
+            self._admission_recheck_at = now + ADMISSION_RECHECK_SECONDS  # a local check, no GitHub call
+            freed = bool(self.sched.admission())
+        if freed:
+            due |= {full for full, until in self._backlog.items() if until <= now}
+        self._capacity_freed = False
+        return due
+
+    def _prune_unserved(self) -> None:
+        """Forget what would rescan a repository that is no longer served (a scan selects only
+        served ones, so such an entry could only trigger empty cycles). Its children, if any, stay
+        under the fork-head guard, which follows the children, not these."""
+        served = {name.lower() for name in self.directory.current.served}
+        for table in (self._backlog, self._retry, self._retry_count, self._hinted, self._recheck):
+            for full in [full for full in table if full.lower() not in served]:
+                if table is self._hinted:
+                    self.hint_outcomes["dropped"] += len(self._hinted[full])
+                del table[full]
+
+    def _listing_failed_for(self, target: Any) -> bool:
+        """The latest listing of `target`'s repositories (its organization, or the repository) failed."""
+        return str(target.name).lower() in {key.lower() for key in self.directory.current.errors}
+
+    def _sync_recheck(self, full: str) -> None:
+        """Set the repository's next recheck to its earliest due hint (none left: no recheck)."""
+        dues = [hint.due for hint in self._hinted.get(full, {}).values() if hint.due > 0]
+        if dues:
+            self._recheck[full] = min(dues)
+        else:
+            self._recheck.pop(full, None)
+        if not self._hinted.get(full):
+            self._hinted.pop(full, None)
+
+    def _note_hints(self, scans: Dict[str, RepoScan]) -> None:
+        """A clean scan that lists a hinted job settles it (a repository that stops being served
+        drops its hints in _prune_unserved). One that does not list it may have come before
+        GitHub's run listings caught up with the event: the job is rechecked on
+        HINT_RECHECK_LADDER until HINT_WINDOW_SECONDS after its event, then dropped. A scan before
+        a hint's recheck is due (another hint's, a catch-up) does not move it along the ladder. A
+        failed scan keeps every hint (the retry rescans)."""
+        now = self.clock()
+        for full, scan in scans.items():
+            hints = self._hinted.get(full)
+            if not hints or scan.error:
+                continue
+            seen = {job.job_id for job in scan.jobs + scan.skipped}
+            for job_id, hint in list(hints.items()):
+                if job_id in seen:
+                    self.hint_outcomes["listed"] += 1
+                    del hints[job_id]
+                elif hint.due > now:
+                    continue
+                elif now - hint.seen_at >= HINT_WINDOW_SECONDS:
+                    self.hint_outcomes["expired"] += 1
+                    del hints[job_id]
+                    log_line(f"hint {full} job {job_id}: still not listed {int(now - hint.seen_at)}s after "
+                             "its event; left to the next catch-up")
+                else:
+                    step = HINT_RECHECK_LADDER[min(hint.misses, len(HINT_RECHECK_LADDER) - 1)]
+                    hint.misses += 1
+                    hint.due = min(now + step, hint.seen_at + HINT_WINDOW_SECONDS)
+            self._sync_recheck(full)
+
+    def _read_hinted(self, repos: set, now: float) -> set:
+        """Before a recheck rescans a repository, read each of its due hinted jobs directly
+        (`GET repos/{repo}/actions/jobs/{id}`, conditional): one that is in progress or completed
+        (taken by another runner, cancelled) is settled with no scan, and so is one that answers
+        404 at a second due recheck (a single 404 may be GitHub's lag too, and a wrong "gone"
+        would leave the job to the hourly catch-up). Any other answer or failure leaves the scan
+        to decide. Returns the repositories still to rescan.
+        This read never serves a job: a JIT runner of the repository takes ANY queued job that
+        fits its labels, so only the scan, which reads every active run's head repository (the
+        very listing that lags), may start a child."""
+        still = set()
+        for full in repos:
+            hints = self._hinted.get(full, {})
+            for job_id, hint in list(hints.items()):
+                if not 0 < hint.due <= now:
+                    continue
+                try:
+                    body = self.client.get(f"repos/{full}/actions/jobs/{job_id}", conditional=True).body
+                except GhError as error:
+                    if error.status == 404:
+                        # Only a 404 at a later recheck counts: a cycle that raised retries the
+                        # same recheck seconds later, which is no evidence the job is gone.
+                        if hint.not_found_due and hint.not_found_due != hint.due:
+                            self.hint_outcomes["gone"] += 1
+                            del hints[job_id]
+                        else:
+                            hint.not_found_due = hint.due
+                    continue
+                except Exception:  # an unreadable answer: the scan decides
+                    continue
+                status = str(body.get("status", "")).lower() if isinstance(body, dict) else ""
+                if status in ("in_progress", "completed"):
+                    self.hint_outcomes["taken"] += 1
+                    del hints[job_id]
+            self._sync_recheck(full)
+            if 0 < self._recheck.get(full, 0.0) <= now:
+                self.scanner.forget(full)
+                still.add(full)
+        return still
+
+    def _served_name(self, full: str) -> Optional[str]:
+        lowered = full.lower()
+        return next((name for name in self.directory.current.served if name.lower() == lowered), None)
+
+    def _on_event(self, event: Any) -> None:
+        """One routed `workflow_job` event: a hint, never a decision.
+          - Any event (any action, any labels) of a repository with live children asks for the
+            fork-head guard: a served repository is scanned (the scan reads the run heads before
+            it serves anything), an unserved one is guarded. This is the guard's only trigger
+            besides catch-ups: a fork run's own events (queued, in_progress) reach us this way.
+          - `queued` with labels of a lane scans that repository (a hint); a `queued` job of an
+            organization repository the directory does not know yet triggers one discovery first.
+          - Anything else (a `completed` of a repository without children: the freed slot is seen
+            locally when the child exits) costs nothing.
+        Only a lane job ever starts a child, whatever triggered the scan."""
+        action = str(getattr(event, "action", ""))
+        self.events_seen[action or "other"] += 1
+        repo = str(getattr(event, "repo", ""))
+        if not REPO_RE.match(repo):
+            return
+        served = self._served_name(repo)
+        if any(c.repo.lower() == repo.lower() for c in self.sched.children.values()):
+            self._guard.add(served or repo)
+        if action != "queued":
+            return
+        lane = lane_for_labels(getattr(event, "labels", ()))
+        if not lane:
+            return
+        if served:
+            self._requested.add(served)
+            job_id = int(getattr(event, "job_id", 0) or 0)
+            if job_id > 0:
+                self._hinted.setdefault(served, {}).setdefault(job_id, Hint(seen_at=self.clock()))
+            return
+        current = self.directory.current
+        known = {name.lower() for name in current.refused} | {name.lower() for name in self.cfg.exclude_repos}
+        target = self.push.covering(repo)
+        if repo.lower() not in known and target is not None and target.kind == "org" \
+                and not any(c.repo.lower() == repo.lower() for c in self.sched.children.values()):
+            self._unknown.add(repo)
+
+    def push_tick(self) -> None:
+        """The dispatcher's only way to GitHub, and nothing in it is a timer. A scan runs only when
+        something happened: a hint (a queued lane event), a guard request (any event of a repository
+        with live children), a forwarder (re)established or rotated (catch-up), a backlog that
+        capacity may now fit, a failed scan's or guard reading's retry, a hinted job the last scan
+        did not list yet (`_recheck`), an unknown repository, a failed listing's retry, or a
+        repository that answered 404. With none of these, an idle pool and one whose VMs run alike
+        make no call at all. Nothing asked for is lost to a failure: a repository whose scan failed
+        is retried (`_retry`), a catch-up whose listing failed waits until that listing succeeds,
+        and when the whole cycle raises, its hints, guard requests and catch-ups are kept.
+        Only a catch-up re-lists every owner (when the last full listing is DISCOVERY_SECONDS old),
+        and a catch-up also retries listings GitHub refused (a 4xx: SAML SSO, gone); a transient
+        failure, an unknown repository or a 404 re-lists just the owners and repositories concerned."""
+        now = self.clock()
+        signals = self.push.poll()
+        for target in signals.established:
+            self._catchup[target.key] = target
+            self._catchup_waiting.pop(target.key, None)
+        for event in signals.events:
+            self._on_event(event)
+        if self._stop_signal is not None or (self.sched.stopping and self.exit_code is None):
+            return
+        if now < self.rate_block_until or now < self._push_retry_at:
+            return  # everything waits; nothing is forgotten
+        current = self.directory.current
+        if current.fetched_at:
+            self._prune_unserved()
+        since = now - self.last_discovery
+        full = not current.fetched_at or bool(self._catchup and since >= DISCOVERY_SECONDS)
+        only: set = set()
+        unknown = set(self._unknown)
+        # an unknown repository whose owner listing failed waits for that listing's own retry
+        asking = {repo for repo in unknown if not self._owner_listing_failed(repo)}
+        if asking and now - self._last_unknown_refresh >= DISCOVERY_MIN_GAP_SECONDS \
+                and since >= DISCOVERY_MIN_GAP_SECONDS:
+            only |= {repo.split("/")[0] for repo in asking}
+            self._last_unknown_refresh = now
+        # A failed listing is retried: on the backoff ladder when it may clear by itself (no answer,
+        # a 5xx, a rate limit); with the next catch-up when GitHub refused it (a 4xx: SAML SSO, gone).
+        transient = {key for key in current.errors if key in current.transient}
+        persistent = set(current.errors) - transient
+        if transient and now >= self._listing_retry_at:
+            only |= transient
+        if persistent and self._catchup:
+            only |= persistent
+        only |= {repo for repo, at in self._relist_at.items() if at <= now}  # unserved after a 404
+        relist = bool(current.fetched_at and current.errors) and bool(only & set(current.errors))
+        discover = full or bool(only)
+        tried = None if full else {key.lower() for key in only}
+        guard_due = self._guard_retry_at is not None and now >= self._guard_retry_at
+        backlog = self._backlog_due(now)
+        retry = {full_name for full_name, at in self._retry.items() if at <= now}
+        recheck = {full_name for full_name, at in self._recheck.items() if at <= now}
+        if recheck:
+            recheck = self._read_hinted(recheck, now)  # a job read as taken or gone needs no rescan
+        waiting = dict(self._catchup_waiting) if discover else {}
+        if not (discover or self._requested or self._guard or self._catchup or guard_due
+                or backlog or retry or recheck):
+            return
+        catchup = dict(self._catchup)
+        requested = set(self._requested)
+        guard = set(self._guard)
+        # A discovery can make a repository served (its fork setting turned off, admin granted, a
+        # listing that failed succeeding): it is scanned at once, as no event of its own may come.
+        # Not on the first discovery: the catch-up of each forwarder coming up covers those.
+        before = {name.lower() for name in current.served} if current.fetched_at else None
+
+        def select() -> set:
+            # an unserved name in `guard` is guarded by the cycle itself (it has children)
+            chosen = requested | guard | backlog | retry | recheck
+            # a catch-up that waited for its listing runs once that listing succeeded
+            resumed = {key: target for key, target in waiting.items() if not self._listing_failed_for(target)}
+            for target in list(catchup.values()) + list(resumed.values()):
+                chosen |= {name for name in self.directory.current.served if target.covers(name)}
+            chosen |= {name for name in unknown if self._served_name(name)}
+            if discover and before is not None:
+                fresh = {name for name in self.directory.current.served if name.lower() not in before}
+                if fresh:
+                    self.scan_counts["newly-served"] += 1
+                chosen |= fresh
+            return chosen
+
+        for name, flag in (("hint", requested), ("guard", guard or guard_due), ("catchup", catchup),
+                           ("backlog", backlog), ("retry", retry), ("recheck", recheck),
+                           ("discovery", discover), ("relist", relist)):
+            if flag:
+                self.scan_counts[name] += 1
+        self._requested.clear()
+        self._guard.clear()
+        self._catchup.clear()
+        for full_name in recheck:
+            self._recheck.pop(full_name, None)
+        try:
+            scans = self.scan_cycle(select, discover=discover, only=None if full else only)
+        except Exception:
+            # Keep what was asked for, and wait a growing delay before trying again.
+            self._requested |= requested
+            self._guard |= guard
+            for key, target in catchup.items():
+                self._catchup.setdefault(key, target)
+            for full_name in recheck:
+                self._recheck.setdefault(full_name, now)
+            if backlog:
+                self._capacity_freed = True  # the freed slot's rescan is not lost either
+            self._push_failures += 1
+            self._push_retry_at = self.clock() + self._retry_delay(self._push_failures)
+            raise
+        self._push_failures = 0
+        if discover:
+            self._after_listing(tried, unknown, now)
+        self._prune_unserved()  # no longer served: the guard watches any children it has
+        self._note_hints(scans)
+        for key, target in list(catchup.items()) + list(waiting.items()):
+            if self._listing_failed_for(target):
+                self._catchup_waiting[key] = target  # not every repository of it is known yet
+            else:
+                self._catchup_waiting.pop(key, None)
+                self.push.note_catchup(target, now)
+
+    def _after_listing(self, tried: Optional[set], unknown: set, started: float) -> None:
+        """After a full (`tried` None) or partial listing that started at `started`: settle the
+        unknown repositories it answered for, and set when a transient listing failure is tried
+        again (a refused one waits for the next catch-up)."""
+        current = self.directory.current
+        # An unknown repository is forgotten once a discovery settled it, but never while its
+        # owner's listing failed: it is asked about again once that listing is retried.
+        self._unknown = {name for name in self._unknown
+                         if name not in unknown or self._owner_listing_failed(name)
+                         or (tried is not None and name.split("/")[0].lower() not in tried)}
+        # A re-list asked for by a 404 of this very cycle (its scans run after the listing) is
+        # kept; an earlier one is settled by this listing when it covered that repository.
+        fresh_from = started + DISCOVERY_MIN_GAP_SECONDS
+        self._relist_at = {name: at for name, at in self._relist_at.items()
+                           if at >= fresh_from or (tried is not None and name.lower() not in tried)}
+        # The ladder steps only when a transient failure was itself tried again (a partial listing
+        # of something else must not push its retry back), and resets once none is left.
+        transient_now = {key for key in current.errors if key in current.transient}
+        if transient_now and (tried is None or {key.lower() for key in transient_now} & tried):
+            self._listing_failures += 1
+            self._listing_retry_at = self.clock() + self._retry_delay(self._listing_failures)
+        elif not transient_now:
+            self._listing_failures, self._listing_retry_at = 0, 0.0
 
     def tick(self) -> None:
         """One pass. It never raises: a failure here is logged, and a failed scan
@@ -2310,18 +2920,26 @@ class Dispatcher:
         try:
             for child, code in self.sched.observe():
                 assigned = "assigned" if child.assigned_at is not None else "never assigned"
-                log_line(f"exit {child.name} lane={child.lane.label} rc={code} ({assigned}; log {child.log_path})")
+                rc = "unknown (adopted)" if child.adopted else code  # an adopted exit status cannot be read
+                log_line(f"exit {child.name} lane={child.lane.label} rc={rc} ({assigned}; log {child.log_path})")
+                self._capacity_freed = True
+                served = self._served_name(child.repo)
+                if served and child.assigned_at is None and not child.terminating:
+                    # It never took its job (clone, JIT or ssh failure, an idle timeout): that job
+                    # may still be queued, and no event will say so. Rescan once its pair may start
+                    # (only a served repository: nothing else would be scanned for it).
+                    self._backlog.setdefault(served, self.sched.backoff_until.get(child.pair, 0.0))
+                if not leaves_no_registration(child, code):
+                    self._reap_candidates[child.repo] = self.clock()  # it may have left a registration
         except Exception as error:
             self._tick_error("observing children", error)
-        if self._scan_due():
-            try:
-                self.scan_cycle()
-            except Exception as error:
-                self._tick_error("scan cycle", error)
-                if self.error_since is None:
-                    self.error_since = self.clock()
-                self._check_sustained()
-                self.next_scan = self.clock() + max(self.cfg.poll_seconds, 10)
+        try:
+            self.push_tick()
+        except Exception as error:
+            self._tick_error("push tick", error)
+            if self.error_since is None:
+                self.error_since = self.clock()
+            self._check_sustained()
         try:
             self.reap_tick()
         except Exception as error:
@@ -2357,7 +2975,16 @@ class Dispatcher:
             return
         # A pass that finds nothing stays silent (poll() logs what it deleted and any failure); one every
         # ~90 s per host would otherwise be ~1000 log lines a day.
-        self.reaper.start(self.directory.current.served, {c.repo for c in self.sched.children.values()})
+        # Only a child that ended badly can leave a registration behind, so the pass visits only the
+        # repositories where one did, for long enough to give vm_reap its 3 passes over 900 s, and an
+        # idle pool makes no reap calls at all.
+        now = self.clock()
+        self._reap_candidates = {repo: at for repo, at in self._reap_candidates.items()
+                                 if now - at < REAP_CANDIDATE_SECONDS}
+        served = [full for full in self.directory.current.served if full in self._reap_candidates]
+        if not served:
+            return
+        self.reaper.start(served, {c.repo for c in self.sched.children.values()})
 
     def startup(self) -> None:
         """Before serving: adopt live children of a previous process, then remove what
@@ -2366,6 +2993,7 @@ class Dispatcher:
             self.sched.adopt(alive=self.adopt_alive, log=log_line)
         except Exception as error:
             self._tick_error("adopting children", error)
+        self._reap_candidates.update(recent_child_repos(self.root, self.clock(), REAP_CANDIDATE_SECONDS))
         try:
             reap_leftovers(self.root, self.tart, alive=self.alive, log=log_line, born=self.born,
                            protect=list(self.sched.children))
@@ -2374,17 +3002,31 @@ class Dispatcher:
         except Exception as error:
             self._tick_error("reaping leftovers", error)
 
+    def stop_push(self) -> None:
+        """Stop every forwarder (and the receiver): their hooks go with them. Never raises."""
+        try:
+            self.push.shutdown()
+        except Exception as error:
+            self._tick_error("stopping forwarders", error)
+
     def run(self) -> int:
         self.startup()
         log_line(f"dispatcher up commit={self.commit} max_jobs={self.cfg.max_jobs} "
-                 f"poll={self.cfg.poll_seconds}s root={self.root} children_adopted={len(self.sched.children)} "
+                 f"discovery=push (no polling) root={self.root} children_adopted={len(self.sched.children)} "
                  f"spawn={spawn_mode()}")
         if _spawn_libc() is None:
             log_line("WARNING: children are started with plain Popen, not with the macOS responsibility "
                      "disclaimed: under launchd their ssh to a VM can fail with 'No route to host'")
         while True:
             if self._stop_signal is not None:
-                log_line(f"signal {self._stop_signal}: stopping children")
+                log_line(f"signal {self._stop_signal}: stopping children and forwarders")
+                # Children first: launchd's exit timeout must not run out on slow forwarders
+                # before every child has been told to delete its VM and registration.
+                try:
+                    self.sched.terminate_all()
+                except Exception as error:
+                    self._tick_error("shutdown", error)
+                self.stop_push()
                 if self.reaper is not None:
                     self.reaper.stop()
                 try:
@@ -2396,6 +3038,7 @@ class Dispatcher:
             self.tick()
             # Never exit while children run: a sustained-failure exit waits for them.
             if self.exit_code is not None and not self.sched.children:
+                self.stop_push()
                 if self.reaper is not None:
                     self.reaper.stop()
                 self.write_snapshot(final=True)
@@ -2417,17 +3060,38 @@ class Dispatcher:
             "repositories": {"served": sorted(current.served), "refused": current.refused,
                              "listing_errors": current.errors},
             "queued": {full: len(s.jobs) for full, s in self.last_scans.items() if s.jobs},
+            # a reading is only as fresh as its last scan, which may be long ago
+            "queued_age_s": {full: int(self.clock() - self.scan_times[full]) for full, s in self.last_scans.items()
+                             if s.jobs and full in self.scan_times},
             "guarded": sorted(self.last_guards),  # unserved repositories still watched for fork-headed runs
             "scan_errors": {full: s.error for full, s in self.last_scans.items() if s.error},
             "backoff": {f"{repo}|{lane}": int(until - self.clock())
                         for (repo, lane), until in self.sched.backoff_until.items() if until > self.clock()},
             "rate": {"remaining": self.client.rate.remaining, "limit": self.client.rate.limit,
                      "headroom": self.client.rate.headroom(), "requests": getattr(self.client, "requests", 0),
-                     "not_modified": getattr(self.client, "not_modified", 0), "note": self.interval_note},
+                     "not_modified": getattr(self.client, "not_modified", 0),
+                     "note": (f"GitHub asked us to wait; no scan for {int(self.rate_block_until - self.clock())}s"
+                              if self.rate_block_until > self.clock() else "")},
             "reap": self.reaper.summary() if self.reaper is not None else None,
             "spawn": spawn_mode(),
             "spawn_error": {kind: dict(rec) for kind, rec in LAST_SPAWN_ERROR.items()} or None,
+            "discovery": self.discovery_summary(),
         }
+
+    def discovery_summary(self) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {"mode": "push",
+                                   "last_discovery_at": self.last_discovery or None,
+                                   "last_scan_at": self.last_scan_at or None,
+                                   "scans": dict(self.scan_counts), "events": dict(self.events_seen),
+                                   "backlog": sorted(self._backlog), "retry": sorted(self._retry),
+                                   "hints": {full: len(hints) for full, hints in sorted(self._hinted.items())},
+                                   "hint_outcomes": dict(self.hint_outcomes),
+                                   "reap_candidates": sorted(self._reap_candidates)}
+        try:
+            summary["push"] = self.push.summary()
+        except Exception as error:  # status must never break the loop
+            summary["push"] = {"error": f"{type(error).__name__}: {error}"}
+        return summary
 
     def write_snapshot(self, final: bool = False) -> None:
         path = os.path.join(self.root, "state", "dispatcher.json")
@@ -2499,6 +3163,20 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
     client = GhClient(cfg.gh_cli, env=env)
     directory = Directory(client, cfg)
     scanner = Scanner(client)
+    import owners_push  # noqa: PLC0415
+
+    push_lines: List[str] = []
+    for owner, error in owners_push.check_owner_types(client, cfg.owners).items():
+        push_lines.append(f"push: ERR cannot tell the account type of {owner}: {error}")
+    try:
+        owners_push.read_forwarder_token(cfg.forwarder_gh_config_dir)
+        login = f"forwarder login: {cfg.forwarder_gh_config_dir} (token found; not shown)"
+    except owners_push.PushError as error:
+        login = f"forwarder login: ERR {error}"
+    binary = owners_push.forwarder_binary(os.path.expanduser("~"))
+    push_lines.append(f"push: {login}; runs {binary or cfg.gh_cli + ' webhook forward'}")
+    for target in owners_push.targets_for(cfg):
+        push_lines.append(f"push: would run a forwarder for {target.label}")
     try:
         repo_set = directory.refresh()
     except GhError as error:
@@ -2508,6 +3186,7 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
     for _ in range(max(1, args.scans)):
         scans = scan_all(scanner, sorted(repo_set.served))
     lines, errors = format_dry_run(cfg, repo_set, scans)
+    lines = push_lines + lines
     served_jobs = sum(len(s.jobs) for s in scans.values())
     skipped_jobs = sum(len(s.skipped) for s in scans.values())
     lines.append(f"dry-run: {len(repo_set.served)} repositories served, {len(repo_set.refused)} refused, "
@@ -2525,9 +3204,48 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
     return 3 if errors else 0
 
 
+def take_run_lock(root: str) -> Optional[int]:
+    """The single-instance lock of `run`: an exclusive, non-blocking flock on <root>/state/run.lock,
+    held (the returned descriptor kept open, close-on-exec so no child or forwarder inherits it)
+    for the life of the process. None when another process holds it."""
+    ensure_private_dir(root)
+    ensure_private_dir(os.path.join(root, "state"))
+    path = os.path.join(root, "state", RUN_LOCK_FILE)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(fd)
+        if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+            return None
+        raise
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    return fd
+
+
 def cmd_run(args: argparse.Namespace) -> int:
-    cfg = load_config(args.config)
     root = args.root
+    import owners_push  # noqa: PLC0415
+
+    # One dispatcher per pool root: a second `run` (a mistaken manual one while the service runs)
+    # must not reach `stop_recorded`, which would stop the running service's forwarders.
+    lock = take_run_lock(root)
+    if lock is None:
+        holder = ""
+        try:
+            with open(os.path.join(root, "state", RUN_LOCK_FILE), encoding="utf-8") as handle:
+                holder = handle.read().strip()
+        except OSError:
+            pass
+        print(f"tartci owners run: another dispatcher{f' (pid {holder})' if holder.isdigit() else ''} "
+              f"already runs for {root}; nothing was changed. Stop it first "
+              "(`tartci owners uninstall` for the service), or use `tartci owners status`", file=sys.stderr)
+        return RUN_LOCKED_EXIT
+    # A previous run's forwarders go first, whatever happens next: a config error (they would
+    # otherwise keep their hooks with nothing to receive them).
+    owners_push.stop_recorded(root, log=log_line)
+    cfg = load_config(args.config)
     tartci_root = tartci_root_dir()
     ensure_private_dir(root)  # holds the state of jobs and their logs: owner only
     for sub in ("state", "logs", "logs/children", "logs/macos", "logs/linux", "fetchcontent-src"):
@@ -2540,13 +3258,31 @@ def cmd_run(args: argparse.Namespace) -> int:
         log_line(f"ERR {problem}; the children authenticate the same way, so no JIT config can be minted "
                  "until `gh auth login` is done for this user (tokens in the environment are not used)")
     client = GhClient(cfg.gh_cli, env=env)
+    try:
+        owners_push.read_forwarder_token(cfg.forwarder_gh_config_dir)
+    except owners_push.PushError as error:
+        # Without it no forwarder can start, and nothing is polled: running on would serve
+        # nothing while looking healthy. Exit 2, as for any other configuration error.
+        raise ConfigError(f"the pool needs the forwarder login ({error}). Log it in as step 3 of "
+                          "docs/owner-pool.md (\"The forwarder login\") shows") from None
+    unverified = owners_push.check_owner_types(client, cfg.owners)  # a personal account: ConfigError
+    for owner, error in sorted(unverified.items()):
+        log_line(f"ERR cannot tell the account type of {owner} ({error}): its forwarder is not started "
+                 "until the type is read (retried with backoff)")
+    push = owners_push.build(cfg, root, client=client, unverified=unverified)
+    log_line(f"push: receiver on 127.0.0.1:{push.receiver.port}, {len(push.forwarders)} forwarder(s) via "
+             f"{'the gh-webhook binary' if push.binary else '`gh webhook forward`'}: "
+             + ", ".join(f.target.label for f in push.forwarders.values()))
     sched = Scheduler(cfg, root, tartci_root, spawn=spawn_process,
                       admission=lambda: pool_admission_open(tartci_root))
     dispatcher = Dispatcher(cfg, root, tartci_root, client, sched, Scanner(client), Directory(client, cfg),
-                            reaper=ReapPass(cfg, root, tartci_root))
+                            reaper=ReapPass(cfg, root, tartci_root), push=push)
     signal.signal(signal.SIGTERM, lambda signum, _frame: dispatcher.request_stop(signum))
     signal.signal(signal.SIGINT, lambda signum, _frame: dispatcher.request_stop(signum))
-    return dispatcher.run()
+    try:
+        return dispatcher.run()
+    finally:
+        push.shutdown()  # whatever ends run(), no forwarder outlives the dispatcher
 
 
 def service_lines(args: argparse.Namespace) -> List[str]:
@@ -2559,7 +3295,81 @@ def service_lines(args: argparse.Namespace) -> List[str]:
         return []
 
 
+def _ago(at: Any, now: float) -> str:
+    if not at:
+        return "never"
+    return f"{_span(now - float(at))} ago"
+
+
+def _span(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 120:
+        return f"{seconds}s"
+    if seconds < 7200:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def lines_for_discovery(disc: Any, now: float, emit: Callable[[str], None]) -> None:
+    """`status` lines for discovery and each forwarder. Every value shown is masked. There is no
+    "next scan": scans follow events, catch-ups and retries only."""
+    if not isinstance(disc, dict):
+        return
+    mask = _mask_tokens
+    push = disc.get("push") if isinstance(disc.get("push"), dict) else {}
+    scans = disc.get("scans") or {}
+    events = disc.get("events") or {}
+    emit(f"  discovery: push via {mask(push.get('mode', '?'))}, receiver {mask(push.get('receiver', '?'))}; "
+         f"last scan {_ago(disc.get('last_scan_at'), now)}, last discovery {_ago(disc.get('last_discovery_at'), now)}")
+    emit("    scans by reason: " + (", ".join(f"{k}={v}" for k, v in sorted(scans.items())) or "none")
+         + "; events: " + (", ".join(f"{k}={v}" for k, v in sorted(events.items())) or "none")
+         + f"; hook API calls {push.get('hook_api_requests', 0)}")
+    hints = disc.get("hints") or {}
+    outcomes = disc.get("hint_outcomes") or {}
+    if hints or outcomes:
+        emit("    hinted jobs: pending " + (", ".join(f"{mask(k)}={v}" for k, v in sorted(hints.items())) or "none")
+             + "; settled " + (", ".join(f"{k}={v}" for k, v in sorted(outcomes.items())) or "none"))
+    stats = push.get("receiver_stats") or {}
+    rejected = {k: v for k, v in stats.items() if k != "accepted" and v}
+    if rejected:
+        emit("    receiver rejected: " + ", ".join(f"{k}={v}" for k, v in sorted(rejected.items())))
+    for row in push.get("forwarders") or []:
+        if not isinstance(row, dict):
+            continue
+        state = str(row.get("state"))
+        parts = [f"forwarder {mask(row.get('target'))}: {state}"]
+        if state == "up" and row.get("uptime_s") is not None:
+            parts.append(f"for {_span(float(row['uptime_s']))}")
+        if state == "up" and row.get("rotate_in_s") is not None:
+            parts.append(f"rotates in {_span(float(row['rotate_in_s']))}")
+        if row.get("retry_in_s") is not None and state != "up":
+            parts.append(f"retry in {row['retry_in_s']}s")
+        parts.append(f"restarts={row.get('restarts', 0)}")
+        if row.get("rotations"):
+            parts.append(f"rotations={row['rotations']}")
+        if row.get("pid"):
+            parts.append(f"pid={row['pid']}")
+        if row.get("hook_id"):
+            parts.append(f"hook={row['hook_id']}")
+        parts.append(f"last event {_ago(row.get('last_event_at'), now)}")
+        parts.append(f"last catch-up {_ago(row.get('last_catchup_at'), now)}")
+        emit("    " + ", ".join(parts))
+        if row.get("last_error"):
+            emit(f"      last error: {mask(row['last_error'])}")
+    if disc.get("backlog"):
+        emit("    backlog (queued, waiting for capacity): " + ", ".join(disc["backlog"]))
+    if disc.get("retry"):
+        emit("    rescan pending after a failed scan: " + ", ".join(disc["retry"]))
+
+
+def _mask_tokens(text: Any) -> str:
+    return re.sub(r"gh[opsu]_[A-Za-z0-9_]+", "gh*_***", str(text))
+
+
 def cmd_status(args: argparse.Namespace) -> int:
+    def emit(line: Any = "") -> None:  # every line, --json too: errors are quoted verbatim
+        print(_mask_tokens(line))
+
     path = os.path.join(args.root, "state", "dispatcher.json")
     snap: Optional[Dict[str, Any]] = None
     try:
@@ -2569,55 +3379,58 @@ def cmd_status(args: argparse.Namespace) -> int:
         snap = None
     alive = bool(snap) and snap.get("running") and pid_alive(snap.get("pid"))  # type: ignore[union-attr]
     if args.json:
-        print(json.dumps({"running": alive, "snapshot": snap, "service": service_lines(args)}, indent=2))
+        emit(json.dumps({"running": alive, "snapshot": snap, "service": service_lines(args)}, indent=2))
         return 0 if alive else 1
     if not snap:
-        print(f"owners dispatcher: no status recorded under {args.root} (not started yet)")
+        emit(f"owners dispatcher: no status recorded under {args.root} (not started yet)")
         for line in service_lines(args):
-            print(line)
+            emit(line)
         return 1
     for line in service_lines(args):
-        print(line)
-    print(f"owners dispatcher: {'running' if alive else 'NOT running'} pid={snap.get('pid')} commit={snap.get('commit')}")
-    print(f"  admitting={snap.get('admitting')} max_jobs={snap.get('max_jobs')} macos_cap={snap.get('macos_cap')}")
+        emit(line)
+    emit(f"owners dispatcher: {'running' if alive else 'NOT running'} pid={snap.get('pid')} commit={snap.get('commit')}")
+    emit(f"  admitting={snap.get('admitting')} max_jobs={snap.get('max_jobs')} macos_cap={snap.get('macos_cap')}")
     if "vm_size" in snap:  # absent from a snapshot written before sizes were configurable
-        print(f"  {format_vm_size(snap['vm_size'])}")
+        emit(f"  {format_vm_size(snap['vm_size'])}")
     if snap.get("spawn"):
-        print(f"  child spawn: {snap['spawn']}")
+        emit(f"  child spawn: {snap['spawn']}")
     spawn_errors = snap.get("spawn_error")
     for kind, rec in sorted(spawn_errors.items()) if isinstance(spawn_errors, dict) else []:
         if isinstance(rec, dict) and rec.get("error"):
             age = int(time.time() - float(rec.get("at") or 0))
-            print(f"  LAST {kind.upper()} SPAWN FAILED {age}s ago: {rec['error']}")
+            emit(f"  LAST {kind.upper()} SPAWN FAILED {age}s ago: {rec['error']}")
     rate = snap.get("rate", {})
     headroom = rate.get("headroom")
-    print(f"  rate remaining={rate.get('remaining')}/{rate.get('limit')} "
+    emit(f"  rate remaining={rate.get('remaining')}/{rate.get('limit')} "
           f"headroom={'n/a' if headroom is None else format(headroom, '.0%')} "
           f"requests={rate.get('requests')} 304s={rate.get('not_modified')} {rate.get('note') or ''}".rstrip())
     repos = snap.get("repositories", {})
-    print(f"  repositories: {len(repos.get('served', []))} served, {len(repos.get('refused', {}))} refused")
+    emit(f"  repositories: {len(repos.get('served', []))} served, {len(repos.get('refused', {}))} refused")
     for full, reason in sorted(repos.get("refused", {}).items()):
-        print(f"    refused {full}: {reason}")
+        emit(f"    refused {full}: {reason}")
     for owner, error in sorted(repos.get("listing_errors", {}).items()):
-        print(f"    ERR listing {owner}: {error}")
+        emit(f"    ERR listing {owner}: {error}")
     for full, error in sorted(snap.get("scan_errors", {}).items()):
-        print(f"    ERR scan {full}: {error}")
+        emit(f"    ERR scan {full}: {error}")
     for full in snap.get("guarded", []):
-        print(f"    guarding {full}: not served, children still running")
+        emit(f"    guarding {full}: not served, children still running")
+    ages = snap.get("queued_age_s") or {}
     for full, count in sorted(snap.get("queued", {}).items()):
-        print(f"    queued {full}: {count}")
+        age = ages.get(full)
+        emit(f"    queued {full}: {count}" + ("" if age is None else f" (as of a scan {_span(float(age))} ago)"))
+    lines_for_discovery(snap.get("discovery"), time.time(), emit)
     reap = snap.get("reap")
     if reap:
-        print(f"  registration reap: {reap.get('passes')} pass(es), {reap.get('fixed')} deleted, "
+        emit(f"  registration reap: {reap.get('passes')} pass(es), {reap.get('fixed')} deleted, "
               f"last {reap.get('last_repo') or '-'} rc={reap.get('last_rc')}"
               + (f", running {reap['running']}" if reap.get("running") else ""))
     children = snap.get("children", [])
-    print(f"  children: {len(children)}")
+    emit(f"  children: {len(children)}")
     for child in children:
-        print(f"    {child['name']} lane={child['lane']} repo={child['repo']} pid={child['pid']} "
+        emit(f"    {child['name']} lane={child['lane']} repo={child['repo']} pid={child['pid']} "
               f"phase={child['phase'] or '-'} assigned={child['assigned']} age={child['age_s']}s")
     for key, seconds in sorted(snap.get("backoff", {}).items()):
-        print(f"    backoff {key}: {seconds}s")
+        emit(f"    backoff {key}: {seconds}s")
     return 0 if alive else 1
 
 
