@@ -51,8 +51,9 @@ emulate a whole x64 machine.
 
 Needs an Apple Silicon Mac with tartci's prerequisites (`./tartci doctor`),
 a `gh` login in the keychain that is an admin of every repository to serve
-(repository-scope JIT registration needs admin), and about 100 GB free for
-the two goldens.
+(repository-scope JIT registration needs admin), and about 250 GB free for
+the two goldens and their base images (the macOS golden is about 97 GB on
+the host, its Xcode base about 89 GB, the Linux golden about 15 GB).
 
 1. **The VM key and goldens.** Both goldens trust one host key,
    `~/.config/tartci/owners-vm-ed25519` (created on first use). Both build
@@ -68,17 +69,19 @@ the two goldens.
 
    Both scripts pull their digest-pinned base image themselves (a no-op when
    it is already in the store). The macOS golden is Cirrus's
-   `macos-golden-gate-base` (Homebrew, no Xcode) pinned by digest, plus the
-   pinned actions runner, `jq` and `gh`; the digest is the image the
-   `:latest` tag resolved to when the script was written, and it is printed
-   in the build's metadata line. The Linux golden is digest-pinned Ubuntu
-   24.04 arm64 with the arm64 and x64 runners, the amd64 libraries the x64
-   runner needs, a boot unit that registers Rosetta when the share is
-   attached, and the baseline tools a hosted job expects, including Node.js
-   LTS with `npm` and `npx` in `/usr/local/bin` (`pnpm/setup` with
-   `runtime: node@...` installs node alone), the GitHub CLI `gh` and Yarn
-   classic. No token enters either golden.
+   `macos-golden-gate-xcode` (macOS 27, Homebrew, Xcode) pinned by digest,
+   plus the pinned actions runner; the digest is the image the `:latest` tag
+   resolved to when the script was written, and it is printed in the build's
+   metadata line. The Linux golden is digest-pinned Ubuntu 24.04 arm64 with
+   the arm64 and x64 runners, the amd64 libraries x64 binaries need, and a
+   boot unit that registers Rosetta when the share is attached. Both carry
+   the toolset of GitHub's hosted images, so a job that passes on a
+   GitHub-hosted runner finds the same commands (see
+   [Golden toolset](#golden-toolset)). No token enters either golden.
    Both scripts end by locking the VM down (see [Security](#security)).
+   With the base image already pulled, a full build took about 7 minutes for
+   Linux and about 6 for macOS on this pool's host. The first macOS build
+   also pulls the Xcode base, about 89 GB on disk.
 
    To rebuild a golden, pass `--rebuild` (the macOS script also accepts
    `--force`). The new golden is built under a temporary name and swapped in
@@ -392,6 +395,76 @@ dispatcher logs which path is active once at startup (`spawn=disclaimed
 posix_spawn` or `Popen fallback`, with a warning) and `tartci owners status`
 shows it as `child spawn:`. [Gotchas](gotchas.md) has the details.
 
+## Golden toolset
+
+Both goldens follow GitHub's hosted runner images (actions/runner-images:
+`images/ubuntu/Ubuntu2604-Readme.md` and `images/macos/macos-26-Readme.md`),
+so a workflow written for `ubuntu-latest` or `macos-latest` does not need to
+install the tools those images ship.
+
+**`owners-linux`** (Ubuntu 24.04 arm64; Cirrus publishes no 26.04 image yet)
+carries every tool in the Ubuntu readme that has an arm64 Linux build:
+GitHub's apt package list as named on noble, gcc 13 and 14, gfortran, clang
+18 with clang-format and clang-tidy, CMake, Ninja, autotools, Python 3 with
+pip, pipx and venv (`python` is `python3`), git with Git LFS, jq, yq, zstd,
+7-Zip, aria2, Docker CE with buildx and compose (the runner user is in the
+`docker` group), Podman, Buildah, Skopeo, kubectl, Helm, Kustomize, kind,
+minikube, Packer, Bazelisk (also as `bazel`), the AWS CLI with SAM and the
+Session Manager plugin, the Azure CLI with `azure-devops`, azcopy, Bicep, the
+Google Cloud CLI, Temurin 11, 17, 21 and 25 (default 25), Maven, Gradle, Ant,
+Kotlin, Go, Rust (rustup, stable, rustfmt, clippy), Ruby, PHP with Composer,
+Perl, .NET 10, PowerShell, vcpkg, nvm, ansible-core, yamllint, PostgreSQL and
+MySQL (root/root), Apache and nginx (installed, services disabled, as on
+GitHub), Firefox with geckodriver, and Node.js LTS with npm, npx, Yarn
+classic and `gh`. On `linux-x64` these tools are arm64 and run natively; x64
+binaries a job downloads (setup-* actions, pnpm's standalone binary) run
+under Rosetta with the amd64 runtime libraries (libatomic, libssl, libcurl,
+libffi, libicu, zlib, ...), and the x64 runner's containers default to
+`linux/amd64`.
+
+**`owners-macos`** is Cirrus's Xcode image (Xcode with its Command Line
+Tools, Homebrew, Node 24 and many of GitHub's formulae), plus from Homebrew
+whatever the macOS readme lists that the base lacks: yq, wget, gnu-tar,
+aria2, p7zip, zstd, pipx, CMake, Ninja, pkgconf, Bazelisk, Packer, the AWS
+CLI, SAM and Session Manager plugin, the Azure CLI, azcopy, Bicep,
+CocoaPods, Carthage, fastlane, SwiftLint, SwiftFormat, xcbeautify, xcodes,
+unxip, Temurin 11, 17, 21 and 25 (default 21), Maven, Gradle, Ant, Kotlin,
+Ruby, PHP with Composer, Go, GCC, PowerShell, a .NET SDK, Google Chrome and
+Firefox, and Rust through rustup.
+
+Both set the runner environment GitHub's images set, in each runner's `.env`
+(the lanes keep lines they do not own): `PATH`, `ImageOS`, `JAVA_HOME` and
+`JAVA_HOME_<v>_X64` (plus `_ARM64` on Linux, `_arm64` on macOS), and
+`RUNNER_TOOL_CACHE` = `AGENT_TOOLSDIRECTORY` at GitHub's path
+(`/opt/hostedtoolcache`, `/Users/runner/hostedtoolcache`), writable by the
+runner, so setup-* actions cache there and prebuilt tool-cache archives with
+fixed prefixes work.
+
+Not installed (ask if a workflow needs one): Google Chrome and ChromeDriver
+on Linux (no arm64 Linux build), Chromium on Linux (snap-only on noble),
+Microsoft Edge, Selenium server, the Android SDK and NDK, Haskell, Swift on
+Linux, Homebrew on Linux, the CodeQL bundle, PHPUnit, extra .NET SDKs and
+Xcode versions, and the multi-version hosted tool caches (setup-* actions
+download those on demand).
+
+Pinning: every direct download is checked against a pinned SHA-256 (the
+Linux script's `TOOL_DOWNLOADS` table, including the Azure DevOps CLI
+extension wheel, each value compared with the publisher's own checksum when it
+was added); apt packages are verified by apt, each third-party apt key is
+accepted only at its pinned fingerprint, and the Docker self-check runs
+`hello-world` by digest. Homebrew bottles are checksummed by Homebrew and not
+version-pinned (GitHub's image does not pin them either). The known exceptions
+are pinned by version or identity instead of by hash: Yarn and the Linux pipx
+tools (ansible-core, yamllint) are exact versions whose dependencies resolve
+at build time, as does the pinned azure-devops wheel's one dependency
+(`distro`); rustup installs the current stable toolchain and the vcpkg
+bootstrap fetches its own tool; and the macOS `google-chrome` cask is
+`sha256 :no_check` upstream, so the build accepts it only with a valid code
+signature from a Developer ID certificate Apple issued to Google's team. Each build prints every tool's
+version (`TARTCI_TOOL`, `TARTCI_BREW`, `TARTCI_CASK` lines) and fails unless
+each one runs. To bump a pinned tool, change its row (version and SHA-256) and
+rebuild.
+
 ## Limits
 
 - **2 macOS jobs at once.** Apple's Virtualization framework runs at most 2
@@ -488,11 +561,12 @@ and login.
 | D9 | defer GitHub App webhooks and scale-set listeners until a measured need | — |
 | D10 | one Linux golden, `owners-linux`, serves `linux-a64` and `linux-x64` | a separate `owners-linux-x64` golden |
 | D11 | golden proofs and smoke jobs run in a dedicated private smoke repository | the fork itself |
-| D12 | macOS golden from Cirrus's base image (no Xcode) | an Xcode image |
+| D12 | macOS golden from Cirrus's base image (no Xcode); superseded by D24 | an Xcode image |
 | D13 | webhook forwarders use a separate, minimal-permission `gh` login | adding hook scopes to the main login |
 | D14 | release the static gate reserve (made optional by D23); child sizes 4 cores / 10240 MB (macOS), 3 cores / 8192 MB (Linux), fixed sizes replaced by D20 | keep the reserve with smaller VMs |
 | D20 | child VM sizes are optional `owners.toml` keys per OS; an unset key leaves the lane's own sizing | sizes fixed in code (D14), a guard exemption for them |
 | D23 | a child VM size is a ceiling, not a reservation: the guest boots at it, but its lease (and waiter) charges at most `1/max_jobs` of the non-gate budget per axis, so `max_jobs` alone caps concurrency; gate leases are never discounted | charging the full size, so the sum of the sizes limits how many children run |
+| D24 | goldens carry GitHub's hosted-image toolset (see [Golden toolset](#golden-toolset)); macOS from Cirrus's Xcode image; Linux stays on Ubuntu 24.04 until Cirrus publishes 26.04 | baseline tools only, each job installing the rest |
 
 ## Open
 
