@@ -2,14 +2,34 @@
 # tart-macos/owners-golden.sh — build the generic `owners-macos` Tart golden used by
 # `tartci serve macos` for the owner-wide runner pool (docs/owner-pool.md, D12).
 #
-# Base:  ghcr.io/cirruslabs/macos-golden-gate-base, pinned by digest (macOS, Homebrew, no
-#        Xcode). The pin is the image the host's `:latest` resolved to when this was written;
-#        bump it deliberately (`tart pull IMAGE:latest`, then read the digest `tart list`
-#        shows for it) so two builds of this script give the same base.
+# Base:  ghcr.io/cirruslabs/macos-golden-gate-xcode, pinned by digest (macOS 27, Homebrew, Xcode
+#        and its Command Line Tools, as on GitHub's macOS images). The pin is the image `:27.2`
+#        (= `:latest`) resolved to when this was written; bump it deliberately (`tart pull
+#        IMAGE:latest`, then read the digest `tart list` shows for it) so two builds of this
+#        script give the same base.
 # Adds:  - the host's dedicated VM SSH public key in admin's authorized_keys
 #        - GitHub Actions runner v2.338.2 (tartci's pinned default) in ~/actions-runner,
 #          verified against tartci's pinned SHA-256, so jobs never download it
-#        - jq and gh from Homebrew (git comes with the Command Line Tools)
+#        - the toolset of GitHub's macOS image (actions/runner-images, macos-26-Readme.md) that
+#          the base lacks, from Homebrew: GNU and archive utilities (yq, wget, gnu-tar, aria2,
+#          p7zip, zstd, git-lfs, gnupg, pkgconf), CMake, Ninja, Bazelisk, Packer, pipx, the AWS
+#          CLI and SAM CLI, Session Manager plugin, Azure CLI, azcopy, Bicep, CocoaPods,
+#          Carthage, fastlane, SwiftLint, SwiftFormat, xcbeautify, xcodes, unxip, Temurin
+#          11/17/21/25 (default 21), Maven, Gradle, Ant, Kotlin, Ruby, PHP with Composer, Go,
+#          GCC, PowerShell, .NET SDK, Node.js 24 (Yarn classic, exact version, via npm), jq and gh, Google Chrome and Firefox;
+#          plus Rust (rustup-init, SHA-256 pinned) with the stable toolchain. Homebrew bottles are
+#          checksummed by Homebrew; versions are not pinned (GitHub's image does not pin them
+#          either) but every tool's version is printed in the build log, and the build fails
+#          unless each one runs. The google-chrome cask is upstream `sha256 :no_check`, so
+#          Homebrew cannot checksum it; the build accepts it only with a valid code signature
+#          from a Developer ID certificate Apple issued to Google's team.
+#        - the runner environment GitHub's image sets, in ~/actions-runner/.env (the runner loads
+#          it; the lane keeps lines it does not own): PATH, ImageOS, RUNNER_TOOL_CACHE =
+#          AGENT_TOOLSDIRECTORY = /Users/runner/hostedtoolcache (GitHub's path, so prebuilt
+#          tool-cache archives with fixed prefixes work; admin owns it), JAVA_HOME and
+#          JAVA_HOME_<v>_X64 / _arm64, LANG/LC_ALL=en_US.UTF-8.
+#        Not installed: Microsoft Edge, Selenium server, Android SDK/NDK, extra .NET SDKs and
+#        Xcode versions, the hosted tool caches (setup-* actions fetch on demand), CodeQL bundle.
 #        - as the LAST step, once key login is proven: sshd refuses password and
 #          keyboard-interactive login, and Screen Sharing / Remote Management are off. The
 #          lanes log in by key only (BatchMode); the `admin` password is used by this script
@@ -34,9 +54,9 @@ set -euo pipefail
 
 export TART_HOME="${TART_HOME:-$HOME/.tart}"
 NAME="owners-macos"
-# Digest of ghcr.io/cirruslabs/macos-golden-gate-base:latest as `tart pull` resolved it on this
-# host (macOS 27.2 guest). `tart list` shows the digest name next to the tag; they are one image.
-BASE="ghcr.io/cirruslabs/macos-golden-gate-base@sha256:4859ea9483a1f6e377301f23a5243798044266a373fc36635e9dcd045e09292f"
+# Digest of ghcr.io/cirruslabs/macos-golden-gate-xcode:27.2 (= :latest) as the registry resolved it
+# (macOS 27.2 guest with Xcode). `tart list` shows the digest name next to the tag; they are one image.
+BASE="ghcr.io/cirruslabs/macos-golden-gate-xcode@sha256:d7641b1d985fd53fbac071c663bf249007b9b387e16b7d576144588acb1d93f9"
 REBUILD=0
 KEY="${TARTCI_VM_SSH_KEY:-$HOME/.config/tartci/owners-vm-ed25519}"
 GUEST_USER="admin"
@@ -44,6 +64,12 @@ GUEST_PASS="admin"          # Cirrus base-image default; used only until the key
 RUNNER_VERSION="${TARTCI_RUNNER_VERSION:-2.338.2}"
 RUNNER_SHA256="${TARTCI_RUNNER_SHA256:-25a065af409ffa317ab4d5a3b614dd15fc9c40f2172bc1b35a1b1258e919a388}"
 RUNNER_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-osx-arm64-${RUNNER_VERSION}.tar.gz"
+# rustup-init (SHA-256 from static.rust-lang.org's .sha256 file next to it).
+RUSTUP_VERSION="1.29.3"
+RUSTUP_SHA256="63752a1919a3a4793173ec70f8f212621a7ce38ba6a246095984482f4de20f9f"
+RUSTUP_URL="https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/aarch64-apple-darwin/rustup-init"
+# Yarn classic, an exact version from the npm registry (as in the Linux golden).
+YARN_VERSION="1.22.22"
 
 note() { printf '• %s\n' "$*" >&2; }
 die()  { printf '✗ %s\n' "$*" >&2; exit 1; }
@@ -180,11 +206,11 @@ same_vm() {
 }
 same_vm "after the key install"
 
-note "provisioning guest (runner v$RUNNER_VERSION, jq, gh)"
-key_ssh "bash -s -- '$RUNNER_URL' '$RUNNER_SHA256' '$RUNNER_VERSION' '$BASE'" <<'GUEST'
+note "provisioning guest (runner v$RUNNER_VERSION and the GitHub-image toolset; this takes a while)"
+key_ssh "bash -s -- '$RUNNER_URL' '$RUNNER_SHA256' '$RUNNER_VERSION' '$BASE' '$RUSTUP_URL' '$RUSTUP_SHA256' '$YARN_VERSION'" <<'GUEST'
 set -euo pipefail
-url="$1"; sha="$2"; ver="$3"; base="$4"
-export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_INSTALL_CLEANUP=1
+url="$1"; sha="$2"; ver="$3"; base="$4"; rustup_url="$5"; rustup_sha="$6"; YARN_VERSION="$7"
+export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ENV_HINTS=1
 eval "$(/opt/homebrew/bin/brew shellenv)"
 
 # Actions runner, unconfigured, at the path tartci expects ($HOME/actions-runner).
@@ -199,14 +225,119 @@ fi
 rm -f "$HOME/actions-runner/.runner" "$HOME/actions-runner/.credentials" \
       "$HOME/actions-runner/.credentials_rsaparams" "$HOME/actions-runner/.path" "$HOME/actions-runner/jit.cfg"
 
-# Baseline tools a GitHub-hosted job expects, where cheap.
-command -v git >/dev/null || { echo "git missing" >&2; exit 1; }
-for f in jq gh; do brew list --formula "$f" >/dev/null 2>&1 || brew install "$f"; done
+# --- the GitHub macOS image toolset ------------------------------------------------------
+# Xcode and its Command Line Tools come with the base (git, clang, swift, xcodebuild).
+xcode-select -p >/dev/null || { echo "no active Xcode developer directory in the base" >&2; exit 1; }
+sudo xcodebuild -license accept
+brew update --quiet >/dev/null
+# Taps from the tools' publishers (HashiCorp and Microsoft): Homebrew core dropped Packer, and
+# Bicep ships only there.
+brew tap hashicorp/tap >/dev/null
+brew tap azure/bicep >/dev/null
+FORMULAE=(
+  jq gh yq wget gnu-tar aria2 p7zip zstd git-lfs gnupg pkgconf openssl@3
+  cmake ninja bazelisk hashicorp/tap/packer pipx
+  awscli aws-sam-cli azure-cli azcopy azure/bicep/bicep
+  cocoapods carthage fastlane swiftlint swiftformat xcbeautify xcodes unxip
+  maven gradle ant kotlin ruby php composer go gcc powershell node@24
+)
+CASKS=(temurin@11 temurin@17 temurin@21 temurin@25 session-manager-plugin dotnet-sdk google-chrome firefox)
+brew install --quiet "${FORMULAE[@]}"  # bash32-lint: nonempty literal list just above
+brew install --quiet --cask "${CASKS[@]}"  # bash32-lint: nonempty literal list just above
+# Node 24 stays the default `node`, as in the base and on GitHub's image: an upgrade of the keg-only
+# node@24 leaves it unlinked, so link it again.
+brew link --force --overwrite node@24 >/dev/null
+# Yarn classic for Node 24 in /opt/homebrew/bin (an exact version; the yarn formula would pull in a
+# second, newest Node).
+/opt/homebrew/bin/npm install --global --no-fund --no-audit --loglevel=error "yarn@$YARN_VERSION"
+git lfs install --system >/dev/null 2>&1 || sudo git lfs install --system >/dev/null
+# Rust for the runner user, as GitHub's image has it: rustup with the stable toolchain.
+curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 600 "$rustup_url" -o /tmp/rustup-init
+[ "$(shasum -a 256 /tmp/rustup-init | awk '{print $1}')" = "$rustup_sha" ] || { echo "rustup-init SHA-256 mismatch" >&2; exit 1; }
+chmod 0755 /tmp/rustup-init
+/tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain stable \
+  --component rustfmt --component clippy >/dev/null
+rm -f /tmp/rustup-init
+
+# --- the runner environment GitHub's image sets ------------------------------------------------
+# The Aqua launcher starts the runner with Homebrew's shellenv; the runner then loads .env, so this
+# PATH is the jobs' PATH. Keg-only Ruby and Node 24 come first, as GitHub's image puts them.
+# GitHub's tool-cache path. Cirrus's base links /Users/runner to admin's home; link it if absent.
+[ -e /Users/runner ] || sudo ln -s "$HOME" /Users/runner
+mkdir -p /Users/runner/hostedtoolcache
+jdk(){ printf '/Library/Java/JavaVirtualMachines/temurin-%s.jdk/Contents/Home' "$1"; }
+cd "$HOME/actions-runner"
+touch .env
+{
+  awk -F= '$1 !~ /^(PATH|LANG|LC_ALL|ImageOS|ImageVersion|RUNNER_TOOL_CACHE|AGENT_TOOLSDIRECTORY|JAVA_HOME.*|DOTNET_.*)$/' .env
+  echo "PATH=$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/opt/ruby/bin:/opt/homebrew/opt/node@24/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.dotnet/tools"
+  echo "LANG=en_US.UTF-8"  # launchd starts the runner without a locale; CocoaPods and fastlane need UTF-8
+  echo "LC_ALL=en_US.UTF-8"
+  echo "ImageOS=macos$(sw_vers -productVersion | cut -d. -f1)"
+  echo "ImageVersion=$(date -u +%Y%m%d).tartci"
+  echo "RUNNER_TOOL_CACHE=/Users/runner/hostedtoolcache"
+  echo "AGENT_TOOLSDIRECTORY=/Users/runner/hostedtoolcache"
+  echo "JAVA_HOME=$(jdk 21)"
+  for v in 11 17 21 25; do
+    echo "JAVA_HOME_${v}_X64=$(jdk "$v")"
+    echo "JAVA_HOME_${v}_arm64=$(jdk "$v")"
+  done
+  echo "DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1"
+  echo "DOTNET_NOLOGO=1"
+} >.env.new
+mv .env.new .env
+cd "$HOME"
+
+# --- self-checks: every tool resolves through the runner's environment and runs ---------------
+check(){ "$@" || { echo "self-check failed: $*" >&2; exit 1; }; }
+first_line(){ local out; out="$("$@" 2>&1)" || { echo "self-check failed: $*" >&2; return 1; }; printf '%s\n' "$out" | awk 'NF { print; exit }'; }
+set -a
+# shellcheck disable=SC1091
+. "$HOME/actions-runner/.env"
+set +a
+TOOL_CHECKS=(
+  "xcodebuild -version" "swift --version" "clang --version" "git --version" "git-lfs --version"
+  "jq --version" "yq --version" "gh --version" "wget --version" "gtar --version" "aria2c --version"
+  "7z i" "zstd --version" "gpg --version" "pkgconf --version" "cmake --version" "ninja --version"
+  "packer version" "pipx --version" "python3 --version" "aws --version" "sam --version"
+  "session-manager-plugin --version" "az --version" "azcopy --version" "bicep --version"
+  "pod --version" "carthage version" "fastlane --version" "swiftlint version"
+  "swiftformat --version" "xcbeautify --version" "xcodes version" "unxip --version"
+  "java -version" "mvn -v" "gradle --version" "ant -version" "kotlin -version" "ruby --version"
+  "gem --version" "php --version" "composer --version" "go version" "gfortran --version"
+  "pwsh --version" "dotnet --version" "node --version" "npm --version" "yarn --version"
+  "rustc --version" "cargo --version" "rustfmt --version"
+)
+for entry in "${TOOL_CHECKS[@]}"; do  # bash32-lint: nonempty literal list just above
+  # shellcheck disable=SC2086  # "tool args" splits into the command line
+  line="$(first_line $entry)"
+  printf 'TARTCI_TOOL %-34s %s\n' "$entry" "$line"
+done
+for tool in bazel bazelisk; do
+  check command -v "$tool" >/dev/null
+done
+for v in 11 17 21 25; do
+  jh="JAVA_HOME_${v}_X64"
+  check test -x "${!jh}/bin/java"
+done
+check [ "$(command -v ruby)" = /opt/homebrew/opt/ruby/bin/ruby ]
+check [ "$(command -v node)" = /opt/homebrew/opt/node@24/bin/node ]
+check [ "$(command -v yarn)" = /opt/homebrew/bin/yarn ]
+check test -w "$RUNNER_TOOL_CACHE"
+check [ "$LANG" = en_US.UTF-8 ]  # without it CocoaPods prints its UTF-8 warning first
+check test -d "/Applications/Google Chrome.app"
+# The google-chrome cask carries no checksum (sha256 :no_check): accept the app only when its
+# signature chains to Apple's Developer ID CA and the leaf certificate names Google's team.
+CHROME_SIGNER='anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "EQHXZ8M8AV"'
+check codesign --verify -R="$CHROME_SIGNER" "/Applications/Google Chrome.app"
+check test -d /Applications/Firefox.app
+brew list --versions | sed 's/^/TARTCI_BREW /'
+brew list --cask --versions | sed 's/^/TARTCI_CASK /'
 brew cleanup -s >/dev/null 2>&1 || true
 rm -rf "$(brew --cache)" 2>/dev/null || true
 
 # Hygiene: nothing from the build session reaches clones.
-rm -rf "$HOME/.tartci" "$HOME/.cache" 2>/dev/null || true
+rm -rf "$HOME/.tartci" "$HOME/.cache" "$HOME/.azure" "$HOME/.dotnet" "$HOME/.npm" 2>/dev/null || true
 echo "TARTCI_GOLDEN base=$base runner=$("$HOME/actions-runner/bin/Runner.Listener" --version) git=$(git --version) jq=$(jq --version) gh=$(gh --version | head -n1) os=$(sw_vers -productVersion) arch=$(uname -m)"
 GUEST
 

@@ -119,5 +119,56 @@ class GoldenListingFailureTests(unittest.TestCase):
                 self.assertIn("keeping the complete build owners-x-build-1", result.stderr)
 
 
+class MacosGoldenToolsetTests(unittest.TestCase):
+    """Static checks of the macOS golden's base, pins, toolset self-checks and hardening order."""
+
+    body = GOLDENS["macos"].read_text(encoding="utf-8")
+
+    def test_base_is_a_digest_pinned_xcode_image(self) -> None:
+        self.assertRegex(self.body, r'(?m)^BASE="ghcr\.io/cirruslabs/macos-[a-z-]+-xcode@sha256:[0-9a-f]{64}"$')
+
+    def test_rustup_init_is_sha256_pinned_and_checked(self) -> None:
+        self.assertRegex(self.body, r'(?m)^RUSTUP_SHA256="[0-9a-f]{64}"$')
+        self.assertIn('[ "$(shasum -a 256 /tmp/rustup-init | awk \'{print $1}\')" = "$rustup_sha" ] || {', self.body)
+        self.assertRegex(self.body, r'(?m)^YARN_VERSION="1\.\d+\.\d+"$')
+        self.assertIn('npm install --global --no-fund --no-audit --loglevel=error "yarn@$YARN_VERSION"', self.body)
+        self.assertIn("brew link --force --overwrite node@24", self.body)
+
+    def test_the_unchecksummed_chrome_cask_must_carry_googles_signature(self) -> None:
+        # A bare --verify or the printed TeamIdentifier would accept a self-signed app claiming the team.
+        signer = re.search(r"(?m)^CHROME_SIGNER='([^']*)'$", self.body)
+        self.assertIsNotNone(signer)
+        for clause in ("anchor apple generic", "certificate 1[field.1.2.840.113635.100.6.2.6] exists",
+                       "certificate leaf[field.1.2.840.113635.100.6.1.13] exists",
+                       'certificate leaf[subject.OU] = "EQHXZ8M8AV"'):
+            self.assertIn(clause, signer.group(1))
+        self.assertIn('check codesign --verify -R="$CHROME_SIGNER" "/Applications/Google Chrome.app"', self.body)
+        self.assertNotIn("TeamIdentifier", self.body)
+        self.assertLess(self.body.index("check codesign --verify"), self.body.index("<<'HARDEN'"))
+
+    def test_every_installed_tool_is_run_by_the_build(self) -> None:
+        for probe in ('"xcodebuild -version"', '"yq --version"', '"wget --version"', '"gtar --version"',
+                      '"cmake --version"', '"packer version"', '"aws --version"', '"az --version"',
+                      '"pod --version"', '"fastlane --version"', '"swiftlint version"', '"java -version"',
+                      '"go version"', '"rustc --version"', '"node --version"', '"yarn --version"'):
+            self.assertIn(probe, self.body)
+        self.assertIn('line="$(first_line $entry)"', self.body)
+        for v in ("11", "17", "21", "25"):
+            self.assertIn(f"temurin@{v}", self.body)
+
+    def test_runner_environment_matches_hosted_images(self) -> None:
+        for line in ('echo "RUNNER_TOOL_CACHE=/Users/runner/hostedtoolcache"',
+                     'echo "AGENT_TOOLSDIRECTORY=/Users/runner/hostedtoolcache"',
+                     'echo "JAVA_HOME=$(jdk 21)"', 'echo "JAVA_HOME_${v}_X64=$(jdk "$v")"'):
+            self.assertIn(line, self.body)
+        self.assertIn('echo "ImageOS=macos', self.body)
+
+    def test_hardening_stays_the_last_guest_step_and_no_token_enters(self) -> None:
+        self.assertLess(self.body.index("<<'GUEST'"), self.body.index("<<'HARDEN'"))
+        self.assertGreater(self.body.index("AuthenticationMethods publickey"), self.body.index("TOOL_CHECKS=("))
+        for needle in ("GH_TOKEN", "GITHUB_TOKEN", "gh auth"):
+            self.assertNotIn(needle, self.body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
