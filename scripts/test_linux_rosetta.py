@@ -261,9 +261,27 @@ class LinuxRosettaLaneTests(unittest.TestCase):
             body, r'sudo tar -xJf "/tmp/\$NODE_TARBALL" -C /usr/local --strip-components=1 --no-same-owner'
         )
         # The build fails unless the guest resolves them there.
-        self.assertIn('for tool in node npm npx; do\n'
+        self.assertIn('for tool in node npm npx gh yarn; do\n'
                       '  check [ "$(command -v "$tool")" = "/usr/local/bin/$tool" ]\n', body)
         self.assertIn('check [ "$(stat -c %u /usr/local/bin)" = 0 ]', body)
+
+    def test_golden_ships_a_sha256_pinned_gh_and_an_exact_yarn(self) -> None:
+        # Hosted images ship the GitHub CLI and Yarn classic; jobs call both without installing them.
+        body = GOLDEN_SCRIPT.read_text(encoding="utf-8")
+        self.assertRegex(body, r'(?m)^GH_VERSION="\d+\.\d+\.\d+"$')
+        self.assertRegex(body, r'(?m)^GH_SHA_ARM64="[0-9a-f]{64}"$')
+        self.assertRegex(body, r'(?m)^YARN_VERSION="1\.\d+\.\d+"$')
+        self.assertRegex(
+            body,
+            r'fetch_pinned "\$GH_TARBALL" "https://github\.com/cli/cli/releases/download/v\$GH_VERSION/'
+            r'\$GH_TARBALL" "\$GH_SHA_ARM64"',
+        )
+        self.assertIn('"$DL_DIR/$GH_TARBALL"', body)
+        self.assertRegex(
+            body, r'sudo tar -xzf "/tmp/\$GH_TARBALL" -C /usr/local --strip-components=1 --no-same-owner'
+        )
+        # An exact version, never a range or a dist-tag: two builds give the same Yarn.
+        self.assertIn('npm install --global --no-fund --no-audit --loglevel=error "yarn@$YARN_VERSION"', body)
 
     def test_golden_self_checks_fail_the_build(self) -> None:
         # Under `set -e`, a failure inside `a && b` (all but the last command) or inside a command

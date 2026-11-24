@@ -76,7 +76,8 @@ the two goldens.
    runner needs, a boot unit that registers Rosetta when the share is
    attached, and the baseline tools a hosted job expects, including Node.js
    LTS with `npm` and `npx` in `/usr/local/bin` (`pnpm/setup` with
-   `runtime: node@...` installs node alone). No token enters either golden.
+   `runtime: node@...` installs node alone), the GitHub CLI `gh` and Yarn
+   classic. No token enters either golden.
    Both scripts end by locking the VM down (see [Security](#security)).
 
    To rebuild a golden, pass `--rebuild` (the macOS script also accepts

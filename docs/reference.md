@@ -326,9 +326,10 @@ golden (`owners-linux`) for both lanes: the pinned Ubuntu base, both runners
 that mounts Rosetta and registers binfmt only when the share is attached, and
 the baseline tools a GitHub-hosted job expects, including Node.js LTS with
 `npm` and `npx` in `/usr/local/bin` (sha256-verified; `pnpm/setup`'s
-`runtime: node@...` installs node without npm). That Node is arm64 on both
-lanes: on `linux-x64` the runner runs under Rosetta, but a job's `node` and
-`npm` run natively. A Linux golden also needs user `admin` with passwordless
+`runtime: node@...` installs node without npm), the GitHub CLI `gh`
+(sha256-verified) and Yarn classic at an exact version. That Node is arm64 on
+both lanes: on `linux-x64` the runner runs under Rosetta, but a job's `node`
+and `npm` run natively. A Linux golden also needs user `admin` with passwordless
 sudo and the public half of `TARTCI_VM_SSH_KEY` in its `authorized_keys`: the
 lane connects with key authentication only, and `owners-golden.sh` finishes by
 making the guest's sshd refuse password login.

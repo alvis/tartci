@@ -19,14 +19,17 @@
 #   - baseline tools a GitHub-hosted job expects: git curl jq unzip zip
 #     build-essential python3 ..., and Node.js LTS with npm and npx in
 #     /usr/local/bin (hosted images ship them; pnpm/setup's
-#     `runtime: node@...` installs node alone)
+#     `runtime: node@...` installs node alone), the GitHub CLI `gh`
+#     (sha256-pinned) and Yarn classic (an exact version from the npm registry)
 #   - for x64: amd64 multiarch libraries the x64 runner needs, and a boot-time
 #     unit that mounts the `rosetta` virtiofs share and registers binfmt. The
 #     unit is a no-op when no Rosetta share is attached (every linux-a64 job).
 #
-# Reproducible: the base image is digest-pinned, and both runner archives and
-# the Node.js archive are checked against pinned SHA-256 values before they
-# enter the VM. The GitHub token is never copied into the VM.
+# Reproducible: the base image is digest-pinned, and both runner archives, the
+# Node.js archive and the gh archive are checked against pinned SHA-256 values
+# before they enter the VM. Yarn has no pinned hash: it is an exact version from
+# the npm registry, which never republishes a version. The GitHub token is never
+# copied into the VM.
 #
 # Hardening (the last guest step, once key login is proven): sshd refuses password and
 # keyboard-interactive login (a drop-in that sorts before cloud-init's, because sshd keeps
@@ -58,6 +61,12 @@ RUNNER_SHA_X64="baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40
 # npx, as GitHub-hosted and Ubicloud images do; Node 25+ no longer bundles corepack.
 NODE_VERSION="26.13.1"
 NODE_SHA_ARM64="89e1853138db51e8b82d3e98ba9c0d3f2956a28e5e55ea1b7e12d25aae92d5dd"
+# GitHub CLI (SHA256 from the release's gh_<version>_checksums.txt) and Yarn classic, as hosted
+# images ship them. Yarn is an exact version from the npm registry, checked only against the
+# registry's own integrity metadata.
+GH_VERSION="2.105.0"
+GH_SHA_ARM64="b1278c75107423d818f1937fd92cafc9e5e9b606631568f68d7fb816f5885a02"
+YARN_VERSION="1.22.22"
 SSH_KEY="${TARTCI_VM_SSH_KEY:-$HOME/.config/tartci/owners-vm-ed25519}"
 GUEST_USER="admin"; GUEST_PASS="admin"
 DL_DIR="${TARTCI_GOLDEN_DOWNLOADS:-$HOME/.cache/tartci/owners-golden}"
@@ -136,6 +145,8 @@ fetch_runner arm64 "$RUNNER_SHA_ARM64"
 fetch_runner x64 "$RUNNER_SHA_X64"
 NODE_TARBALL="node-v$NODE_VERSION-linux-arm64.tar.xz"
 fetch_pinned "$NODE_TARBALL" "https://nodejs.org/dist/v$NODE_VERSION/$NODE_TARBALL" "$NODE_SHA_ARM64"
+GH_TARBALL="gh_${GH_VERSION}_linux_arm64.tar.gz"
+fetch_pinned "$GH_TARBALL" "https://github.com/cli/cli/releases/download/v$GH_VERSION/$GH_TARBALL" "$GH_SHA_ARM64"
 
 # The trap comes first: a failing pull, clone or `tart set` must not leave a partial $BUILD.
 RPID=""; DONE=0; BUILT=0; BOOT_LOG=""
@@ -228,16 +239,17 @@ same_vm(){
 }
 same_vm "after the key install"
 
-note "copy the runner and Node.js archives (sha256-verified on the host)"
+note "copy the runner, Node.js and GitHub CLI archives (sha256-verified on the host)"
 scp -q -o BatchMode=yes -i "$SSH_KEY" ${SSH_COMMON[@]+"${SSH_COMMON[@]}"} \
   "$DL_DIR/actions-runner-linux-arm64-$RUNNER_VERSION.tar.gz" \
   "$DL_DIR/actions-runner-linux-x64-$RUNNER_VERSION.tar.gz" \
   "$DL_DIR/$NODE_TARBALL" \
+  "$DL_DIR/$GH_TARBALL" \
   "$GUEST_USER@$IP:/tmp/"
 
 # ---- guest provisioning -------------------------------------------------------
 note "provision the guest"
-${KSSH[@]+"${KSSH[@]}"} "$GUEST_USER@$IP" "RUNNER_VERSION='$RUNNER_VERSION' ENABLE_ROSETTA='$ENABLE_ROSETTA' NODE_TARBALL='$NODE_TARBALL' bash -s" <<'GUEST'
+${KSSH[@]+"${KSSH[@]}"} "$GUEST_USER@$IP" "RUNNER_VERSION='$RUNNER_VERSION' ENABLE_ROSETTA='$ENABLE_ROSETTA' NODE_TARBALL='$NODE_TARBALL' GH_TARBALL='$GH_TARBALL' YARN_VERSION='$YARN_VERSION' bash -s" <<'GUEST'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 sudo -n true || { echo "✗ admin lacks passwordless sudo"; exit 1; }
@@ -260,6 +272,13 @@ NODE_DIR="${NODE_TARBALL%.tar.xz}"
 sudo tar -xJf "/tmp/$NODE_TARBALL" -C /usr/local --strip-components=1 --no-same-owner \
   "$NODE_DIR/bin" "$NODE_DIR/include" "$NODE_DIR/lib" "$NODE_DIR/share"
 rm -f "/tmp/$NODE_TARBALL"
+
+# --- GitHub CLI and Yarn classic in /usr/local/bin ---------------------------------
+GH_DIR="${GH_TARBALL%.tar.gz}"
+sudo tar -xzf "/tmp/$GH_TARBALL" -C /usr/local --strip-components=1 --no-same-owner \
+  "$GH_DIR/bin/gh" "$GH_DIR/share/man"
+rm -f "/tmp/$GH_TARBALL"
+sudo /usr/local/bin/npm install --global --no-fund --no-audit --loglevel=error "yarn@$YARN_VERSION"
 
 # --- arm64 runner (the linux-a64 lane; runner.sh `cd ~/actions-runner`) --------
 rm -rf "$HOME/actions-runner" "$HOME/actions-runner-x64"
@@ -349,7 +368,11 @@ arm64_version="$("$HOME/actions-runner/bin/Runner.Listener" --version)"
 echo "arm64 runner: $arm64_version"
 node_version="$(/usr/local/bin/node --version)"; npm_version="$(/usr/local/bin/npm --version)"
 echo "node $node_version, npm $npm_version"
-for tool in node npm npx; do
+# The whole output, then its first line: `gh --version | head -1` can fail under pipefail.
+gh_version="$(/usr/local/bin/gh --version)"; gh_version="${gh_version%%$'\n'*}"
+yarn_version="$(/usr/local/bin/yarn --version)"
+echo "$gh_version, yarn $yarn_version"
+for tool in node npm npx gh yarn; do
   check [ "$(command -v "$tool")" = "/usr/local/bin/$tool" ]
 done
 check [ "$(stat -c %u /usr/local/bin)" = 0 ]
