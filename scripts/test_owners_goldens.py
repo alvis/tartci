@@ -163,6 +163,13 @@ class MacosGoldenToolsetTests(unittest.TestCase):
             self.assertIn(line, self.body)
         self.assertIn('echo "ImageOS=macos', self.body)
 
+    def test_guest_script_is_parsed_whole_before_it_runs(self) -> None:
+        # bash -s reads the script from stdin; a step that reads stdin would eat the rest of it.
+        guest = self.body.split("<<'GUEST'\n", 1)[1].split("\nGUEST\n", 1)[0]
+        code = [l for l in guest.splitlines() if l and not l.startswith("#")]
+        self.assertEqual(code[0], "{")
+        self.assertEqual(code[-1], "} </dev/null")
+
     def test_hardening_stays_the_last_guest_step_and_no_token_enters(self) -> None:
         self.assertLess(self.body.index("<<'GUEST'"), self.body.index("<<'HARDEN'"))
         self.assertGreater(self.body.index("AuthenticationMethods publickey"), self.body.index("TOOL_CHECKS=("))

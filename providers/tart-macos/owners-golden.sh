@@ -208,6 +208,11 @@ same_vm "after the key install"
 
 note "provisioning guest (runner v$RUNNER_VERSION and the GitHub-image toolset; this takes a while)"
 key_ssh "bash -s -- '$RUNNER_URL' '$RUNNER_SHA256' '$RUNNER_VERSION' '$BASE' '$RUSTUP_URL' '$RUSTUP_SHA256' '$YARN_VERSION'" <<'GUEST'
+# One brace group, so bash parses the whole script before running any of it: stdin is the script,
+# and a step that reads stdin (a cask's installer did) would otherwise swallow the rest of it and
+# end the session with status 0, skipping every later step and self-check. A truncated script is
+# a syntax error, so it fails the build.
+{
 set -euo pipefail
 url="$1"; sha="$2"; ver="$3"; base="$4"; rustup_url="$5"; rustup_sha="$6"; YARN_VERSION="$7"
 export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ENV_HINTS=1
@@ -339,6 +344,7 @@ rm -rf "$(brew --cache)" 2>/dev/null || true
 # Hygiene: nothing from the build session reaches clones.
 rm -rf "$HOME/.tartci" "$HOME/.cache" "$HOME/.azure" "$HOME/.dotnet" "$HOME/.npm" 2>/dev/null || true
 echo "TARTCI_GOLDEN base=$base runner=$("$HOME/actions-runner/bin/Runner.Listener" --version) git=$(git --version) jq=$(jq --version) gh=$(gh --version | head -n1) os=$(sw_vers -productVersion) arch=$(uname -m)"
+} </dev/null
 GUEST
 
 note "verifying the console Aqua session the runner launcher requires"
