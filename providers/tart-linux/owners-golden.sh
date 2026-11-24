@@ -322,6 +322,10 @@ scp -q -o BatchMode=yes -i "$SSH_KEY" ${SSH_COMMON[@]+"${SSH_COMMON[@]}"} \
 # ---- guest provisioning -------------------------------------------------------
 note "provision the guest (the GitHub-image toolset; this takes a while)"
 ${KSSH[@]+"${KSSH[@]}"} "$GUEST_USER@$IP" "RUNNER_VERSION='$RUNNER_VERSION' ENABLE_ROSETTA='$ENABLE_ROSETTA' NODE_TARBALL='$NODE_TARBALL' GH_TARBALL='$GH_TARBALL' YARN_VERSION='$YARN_VERSION' bash -s" <<'GUEST'
+# One brace group, so bash parses the whole script before running any of it: stdin is the script,
+# and a step that reads stdin would otherwise swallow the rest of it and end the session with
+# status 0, skipping every later step and self-check. A truncated script is a syntax error.
+{
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 sudo -n true || { echo "✗ admin lacks passwordless sudo"; exit 1; }
@@ -683,6 +687,7 @@ for v in 11 17 21 25; do
 done
 check [ "$(java -version 2>&1 | awk -F'"' 'NR==1 { split($2, v, "."); print v[1] }')" = 25 ]
 check test -w "$RUNNER_TOOL_CACHE"
+# shellcheck disable=SC2154  # ImageOS comes from the runner .env sourced above
 check [ "$ImageOS" = ubuntu24 ]
 check grep -qx 'DOCKER_DEFAULT_PLATFORM=linux/amd64' "$HOME/actions-runner-x64/.env"
 for svc in mysql postgresql apache2 nginx; do
@@ -722,6 +727,7 @@ rm -rf "$TOOLS" "$HOME/.cache" "$HOME/.azure" "$HOME/.npm" "$HOME/.dotnet" "$HOM
 sudo rm -f /var/lib/dhcp/*.leases 2>/dev/null || true
 sudo fstrim -a >/dev/null 2>&1 || true
 sync
+} </dev/null
 GUEST
 
 # ---- hardening: the LAST guest step. The password was needed only to install the key. -----
