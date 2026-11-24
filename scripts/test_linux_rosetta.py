@@ -299,5 +299,104 @@ class LinuxRosettaLaneTests(unittest.TestCase):
             self.assertIn(f'check test -x "$HOME/{runner}/run.sh"', section.group(1))
 
 
+    def test_golden_toolset_downloads_are_sha256_pinned(self) -> None:
+        # Every direct download of the GitHub-image toolset goes through fetch_pinned with a pinned SHA-256.
+        body = GOLDEN_SCRIPT.read_text(encoding="utf-8")
+        table = re.search(r"(?ms)^TOOL_DOWNLOADS='\n(.*?)^'$", body)
+        assert table is not None
+        rows = [row.split() for row in table.group(1).splitlines() if row.strip()]
+        keys = [row[0] for row in rows]
+        self.assertEqual(len(keys), len(set(keys)))
+        for row in rows:
+            with self.subTest(row[0]):
+                self.assertEqual(len(row), 5, row)
+                key, version, file, url, sha = row
+                self.assertRegex(key, r"^[A-Z0-9]+$")
+                self.assertRegex(version, r"^\d+(\.\d+)+$")
+                self.assertRegex(url, r"^https://")
+                self.assertRegex(sha, r"^[0-9a-f]{64}$")
+                self.assertIn("@V@", file + url)
+                # The guest uses each row by its manifest name.
+                self.assertIn(f"${key}_FILE", body)
+        for tool in ("YQ", "KUBECTL", "HELM", "AWSCLI", "CMAKE", "GO", "RUSTUP", "GRADLE", "MAVEN", "AZDEVOPS"):
+            self.assertIn(tool, keys)
+        # Guest installs outside the table are exact versions or a pinned wheel, never "latest".
+        self.assertIn('az extension add --source "$TOOLS/$AZDEVOPS_FILE"', body)
+        self.assertNotIn("az extension add --name", body)
+        pipx = re.findall(r"(?m)\bpipx install (\S+)", body)
+        self.assertEqual(len(pipx), 2)
+        for spec in pipx:
+            self.assertRegex(spec, r"^[a-z][a-z0-9-]*==\d+(\.\d+)+$")
+        # The manifest temp file only exists once the cleanup trap that removes it is set.
+        self.assertLess(body.index("trap cleanup EXIT"), body.index('MANIFEST="$(mktemp'))
+        loop = re.search(r'(?ms)^while read -r key ver file url sha; do$(.*?)^done <<<"\$TOOL_DOWNLOADS"$', body)
+        assert loop is not None
+        self.assertIn('fetch_pinned "$file" "$url" "$sha"', loop.group(1))
+        self.assertRegex(body, r'(?m)^VCPKG_COMMIT="[0-9a-f]{40}"$')
+        self.assertIn('[ "$(sudo git -C /usr/local/share/vcpkg rev-parse HEAD)" = "$VCPKG_COMMIT" ]', body)
+
+    def test_golden_third_party_apt_keys_are_pinned_by_fingerprint(self) -> None:
+        body = GOLDEN_SCRIPT.read_text(encoding="utf-8")
+        repo_fn = re.search(r"(?ms)^apt_repo\(\)\{.*?^\}$", body)
+        assert repo_fn is not None
+        # The key must carry the pinned fingerprint; the keyring then holds only that key, and the
+        # source is arm64-only so the amd64 multiarch never asks it for amd64 indexes.
+        self.assertIn('grep -q "^fpr:::::::::$3:"', repo_fn.group(0))
+        self.assertIn('gpg --batch --export "$3"', repo_fn.group(0))
+        self.assertIn("Architectures: arm64", repo_fn.group(0))
+        repos = re.findall(r"(?m)^apt_repo (\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)$", body)
+        self.assertEqual({r[0] for r in repos},
+                         {"docker", "azure-cli", "google-cloud", "adoptium", "hashicorp", "mozilla"})
+        for name, key_url, fpr, uri, _suite, _component in repos:
+            with self.subTest(name):
+                self.assertRegex(fpr, r"^[0-9A-F]{40}$")
+                self.assertTrue(key_url.startswith("https://") and uri.startswith("https://"))
+
+    def test_golden_has_the_tools_the_failed_owner_jobs_lacked(self) -> None:
+        # yq (linux-a64), docker (linux-x64), and libatomic for x64 binaries under Rosetta.
+        body = GOLDEN_SCRIPT.read_text(encoding="utf-8")
+        section = re.search(r"(?ms)^# --- self-checks -+$(.*?)^sudo apt-get clean$", body)
+        assert section is not None
+        checks = section.group(1)
+        for probe in ('"yq --version"', '"docker --version"', '"docker buildx version"',
+                      '"docker compose version"', '"kubectl version --client"', '"aws --version"',
+                      '"az --version"', '"gcloud --version"', '"java -version"', '"go version"',
+                      '"rustc --version"', '"cmake --version"', '"python --version"'):
+            self.assertIn(probe, checks)
+        self.assertIn('line="$(first_line $entry)"', checks)
+        self.assertRegex(checks, r"(?m)^HELLO_WORLD=hello-world@sha256:[0-9a-f]{64}$")
+        self.assertIn('check sudo docker run --rm "$HELLO_WORLD" >/dev/null', checks)
+        self.assertIn('check sudo docker run --rm --platform linux/amd64 "$HELLO_WORLD" >/dev/null', checks)
+        # Functional: the x64 Node dlopens each library through the amd64 loader under Rosetta.
+        self.assertIn('check "$x64_node" -e', checks)
+        self.assertRegex(checks, r"for so in libatomic\.so\.1 ")
+        self.assertIn('check dpkg-query -W "$p:amd64" >/dev/null', checks)
+        libs = re.search(r'(?ms)^AMD64_LIBS="(.*?)"$', body)
+        assert libs is not None
+        for lib in ("libatomic1", "libgcc-s1", "zlib1g", "libssl3t64", "libcurl4t64", "libffi8",
+                    "liblzma5", "libbz2-1.0", "libreadline8t64", "libsqlite3-0", "libtinfo6", "libicu74"):
+            self.assertIn(lib, libs.group(1).split())
+        self.assertIn('sudo usermod -aG docker "$(id -un)"', body)
+
+    def test_golden_sets_the_runner_environment_hosted_images_set(self) -> None:
+        body = GOLDEN_SCRIPT.read_text(encoding="utf-8")
+        for line in ('echo "ImageOS=ubuntu24"', 'echo "RUNNER_TOOL_CACHE=/opt/hostedtoolcache"',
+                     'echo "AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache"',
+                     'echo "JAVA_HOME=/usr/lib/jvm/temurin-25-jdk-arm64"',
+                     'echo "JAVA_HOME_${v}_X64=/usr/lib/jvm/temurin-$v-jdk-arm64"'):
+            self.assertIn(line, body)
+        self.assertIn("for v in 11 17 21 25; do", body)
+        # Both runners get it; only the x64 runner defaults containers to amd64.
+        self.assertIn('install -m 0644 /tmp/tartci-image.env "$HOME/actions-runner/.env"', body)
+        self.assertIn('{ cat /tmp/tartci-image.env; echo "DOCKER_DEFAULT_PLATFORM=linux/amd64"; } '
+                      '>"$HOME/actions-runner-x64/.env"', body)
+        self.assertIn('sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/hostedtoolcache', body)
+
+    def test_golden_never_handles_a_github_token(self) -> None:
+        body = GOLDEN_SCRIPT.read_text(encoding="utf-8")
+        for needle in ("GH_TOKEN", "GITHUB_TOKEN", "gh auth", "generate-jitconfig", "jit.cfg"):
+            self.assertNotIn(needle, body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
