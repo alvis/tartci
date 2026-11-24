@@ -84,7 +84,18 @@ for tool in tart sshpass scp ssh-keygen curl shasum ssh; do
 done
 case "$BASE" in *@sha256:*) ;; *) die "--base must be digest-pinned (@sha256:...) so the golden is reproducible";; esac
 
-vm_exists(){ tart list --quiet 2>/dev/null | grep -qxF "$1"; }
+# A failed `tart list` must not read as "absent": the swap-in would then rename onto the old golden.
+vm_exists(){
+  local names=""
+  for _ in 1 2 3; do
+    if names="$(tart list --quiet)"; then
+      grep -qxF -- "$1" <<<"$names"
+      return
+    fi
+    sleep 2
+  done
+  die "tart list failed; cannot tell whether $1 exists"
+}
 if vm_exists "$NAME"; then
   [ "$REBUILD" = 1 ] || die "$NAME already exists in $TART_HOME (use --rebuild to replace it)"
 fi
@@ -132,6 +143,12 @@ cleanup(){
   [ -n "$RPID" ] && { tart stop "$BUILD" >/dev/null 2>&1 || true; kill "$RPID" 2>/dev/null || true; }
   [ -z "$BOOT_LOG" ] || rm -f "$BOOT_LOG"
   if [ "$DONE" != 1 ]; then
+    # Without a listing every VM looks absent, and the recovery below could delete a finished
+    # build or leave no VM named $NAME: rename and delete nothing.
+    if ! tart list --quiet >/dev/null; then
+      note "tart list failed, so nothing was renamed or deleted; check tart list for $NAME, $BUILD and $OLD"
+      return
+    fi
     # Interrupted mid-swap: $NAME is gone. Put a golden back under it before deleting anything:
     # the new build if it finished, else the old golden.
     if ! vm_exists "$NAME"; then
@@ -148,6 +165,9 @@ cleanup(){
       if [ "$BUILT" = 1 ] && ! vm_exists "$BUILD" && vm_exists "$NAME"; then
         # Interrupted right after the second rename: the new golden is already in place.
         note "interrupted after the swap; the new $NAME is in place$(vm_exists "$OLD" && echo " (delete the previous one, $OLD, when happy)")"
+      elif [ "$BUILT" = 1 ] && vm_exists "$BUILD"; then
+        # A complete build that was not swapped in is never deleted.
+        note "keeping the complete build $BUILD: it was not swapped in (tart rename it to $NAME once $NAME is out of the way, or tart delete it)"
       elif vm_exists "$NAME" || ! vm_exists "$OLD"; then
         note "build failed — deleting the partial $BUILD"
         tart delete "$BUILD" >/dev/null 2>&1 || true
