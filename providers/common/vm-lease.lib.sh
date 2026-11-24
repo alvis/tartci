@@ -674,6 +674,36 @@ tartci_vm_lease_granted_cores(){
   printf '%s' "$cores"
 }
 
+# Opt-in ceiling sizing. The owners pool sets TARTCI_VM_LEASE_SHARE_SLOTS to its
+# max_jobs: a VM's configured size is then a ceiling a job may burst to, not a
+# reservation, and its lease charges at most a 1/N share of the non-gate budget on
+# each axis. N such VMs always fit together, so the pool's own job cap — not the
+# sum of the ceilings — decides how many run at once. The lease, its waiter and the
+# macOS lease-fit probe all use this charge. Prints "<cores> <mem_mb>" to
+# charge for a VM of $1 cores / $2 MB (empty: derived) at priority $3. Unset, a gate
+# lease, or a parked warm VM: the size unchanged. An unreadable profile axis leaves
+# that axis unchanged (the lease store then judges the full size, as without it).
+tartci_vm_lease_share_charge(){
+  local cores="$1" mem_mb="${2:-}" priority="$3" slots="${TARTCI_VM_LEASE_SHARE_SLOTS:-}" share
+  if tartci_positive_int_or_empty "$slots" \
+     && tartci_vm_lease_is_non_gate_priority "$priority" \
+     && [ "${TARTCI_VM_LEASE_MEMORY_ONLY:-0}" != 1 ]; then
+    share="$(tartci_profile_value non_gate_capacity_cores 2>/dev/null)" || share=""
+    if tartci_positive_int_or_empty "$share" && tartci_positive_int_or_empty "$cores"; then
+      share=$(( share / slots ))
+      [ "$share" -ge 1 ] || share=1
+      [ "$cores" -le "$share" ] || cores="$share"
+    fi
+    share="$(tartci_profile_value non_gate_capacity_mem_mb 2>/dev/null)" || share=""
+    if tartci_positive_int_or_empty "$share" && tartci_positive_int_or_empty "$mem_mb"; then
+      share=$(( share / slots ))
+      [ "$share" -ge 1 ] || share=1
+      [ "$mem_mb" -le "$share" ] || mem_mb="$share"
+    fi
+  fi
+  printf '%s %s\n' "$cores" "$mem_mb"
+}
+
 # --- ranked VM lease waiters (opt-in: [leases] rank_vm_waiters) ---------------
 #
 # A lane registers as a waiter once it has taken a job and wants a VM, BEFORE
@@ -784,6 +814,9 @@ tartci_vm_lease_waiter_register(){
   tartci_vm_lease_waiters_enabled || return 0
   cores="$(tartci_vm_lease_granted_cores "$cores" "$priority")"
   tartci_positive_int_or_empty "$mem_mb" || mem_mb="$(tartci_vm_lease_derived_mem_mb "$cores")"
+  # Under ceiling sizing a waiter holds room for the share it will be charged,
+  # never its ceiling (tartci_vm_lease_share_charge).
+  read -r cores mem_mb <<<"$(tartci_vm_lease_share_charge "$cores" "$mem_mb" "$priority")"
   _tartci_vm_waiter_args=(
     --id "waiter-$lane" --cores "$cores" --mem-mb "$mem_mb" --priority "$priority"
     --kind "$kind" --pid "$$" --lane "$lane" --label "$labels"
@@ -895,9 +928,17 @@ tartci_acquire_vm_lease(){
   if ! tartci_positive_int_or_empty "$mem_mb"; then
     mem_mb="$(tartci_vm_lease_derived_mem_mb "$cores")"
   fi
+  # Opt-in ceiling sizing (tartci_vm_lease_share_charge): the guest boots at the
+  # size above; the lease may charge less.
+  local boot_cores="$cores" boot_mem_mb="$mem_mb"
+  read -r cores mem_mb <<<"$(tartci_vm_lease_share_charge "$cores" "$mem_mb" "$priority")"
+  if [ "$cores" != "$boot_cores" ] || [ "$mem_mb" != "$boot_mem_mb" ]; then
+    tartci_vm_lease_note "charging $kind lease a 1/$TARTCI_VM_LEASE_SHARE_SLOTS share: cores $boot_cores -> $cores, mem_mb ${boot_mem_mb:-auto} -> ${mem_mb:-auto} (the guest boots at the full size)"
+  fi
   # The VM memory size charges the memory axis its real footprint. It is also
   # the size the guest is booted at (tartci_set_tart_vm_size): what admission
-  # charges and what the guest boots with must be the same number.
+  # charges and what the guest boots with must be the same number — except under
+  # the opt-in ceiling sizing above, which charges a share and boots the ceiling.
   local mem_args=()
   if tartci_positive_int_or_empty "$mem_mb" && [ -n "$mem_mb" ]; then
     mem_args=(--mem-mb "$mem_mb")
@@ -1006,15 +1047,16 @@ tartci_acquire_vm_lease(){
   TARTCI_FAIR_DEMAND_SINCE=0
   tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
   TARTCI_ACTIVE_VM_LEASE_ID="$lease_id"
+  # The size the guest boots at: the charge itself, except under ceiling sizing.
   # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
-  TARTCI_ACTIVE_VM_LEASE_CORES="$cores"
+  TARTCI_ACTIVE_VM_LEASE_CORES="$boot_cores"
   # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
-  TARTCI_ACTIVE_VM_LEASE_MEM_MB="$mem_mb"
+  TARTCI_ACTIVE_VM_LEASE_MEM_MB="$boot_mem_mb"
   tartci_start_vm_lease_heartbeat "$lease_id"
   if [ -n "$disk_path" ]; then
     disk_summary="$(printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin)["disk"]; gib=1024**3; print("disk_free_gib=%.1f disk_reserved_gib=%.1f disk_requested_gib=%.1f disk_required_gib=%.1f disk_device=%s" % (d["free_bytes"]/gib,d["reserved_bytes"]/gib,d["requested_bytes"]/gib,d["required_bytes"]/gib,d["device_id"]))')"
   fi
-  tartci_vm_lease_note "lease acquired id=$lease_id cores=$cores mem_mb=${mem_mb:-auto} priority=$priority ${disk_summary}"
+  tartci_vm_lease_note "lease acquired id=$lease_id cores=$cores mem_mb=${mem_mb:-auto} boot_cores=$boot_cores boot_mem_mb=${boot_mem_mb:-auto} priority=$priority ${disk_summary}"
   [ -z "$disk_path" ] || tartci_vm_lease_disk_headroom_event "$out"
   tartci_vm_lease_home_unread_event "$out"
   if declare -F event >/dev/null 2>&1; then

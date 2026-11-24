@@ -1137,6 +1137,145 @@ PY
             ["3", "effective=3"],
         )  # 8 clamped to the 3-core budget and exposed to the provider
 
+    def test_share_slots_charge_a_share_and_boot_the_ceiling(self) -> None:
+        """Ceiling sizing (the owners pool): the lease charges at most 1/N of the non-gate
+        budget per axis while the guest is still handed its full size. A gate lease and an
+        unset knob charge the full size, as before."""
+        with tempfile.TemporaryDirectory() as td:
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={Path(td) / "leases"}
+                export TARTCI_HOST_CORES=16
+                export TARTCI_HOST_MEM_MB=262144
+                export TARTCI_ROLE=dedicated-builder
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
+                note() {{ :; }}
+                source {HELPER}
+                trap tartci_release_vm_lease EXIT
+                tartci_profile_value() {{
+                  case "$1" in
+                    non_gate_capacity_cores) echo 14 ;;
+                    non_gate_capacity_mem_mb) echo 53248 ;;
+                    *) echo 0 ;;
+                  esac
+                }}
+                one() {{  # slots priority cores mem
+                  TARTCI_VM_LEASE_SHARE_SLOTS="$1"
+                  tartci_acquire_vm_lease unit-vm "$3" tart-linux-vm "$2" self-hosted,linux-a64 "$4" {Path(td)}
+                  python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
+                    python3 -c 'import json,sys; r=json.load(sys.stdin)["leases"][0]; print(r["lease_size_cores"], r["lease_size_mem_mb"], end=" ")'
+                  printf 'boot=%s/%s\\n' "$TARTCI_ACTIVE_VM_LEASE_CORES" "$TARTCI_ACTIVE_VM_LEASE_MEM_MB"
+                  tartci_release_vm_lease
+                }}
+                one 4 vm 4 10240
+                one 4 vm 8 20000
+                one 20 vm 4 10240
+                one "" vm 4 10240
+                one 4 gate 8 20000
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip().splitlines(),
+            [
+                "3 10240 boot=4/10240",  # 14 // 4 = 3 cores; 10240 is under the 13312 MB share
+                "3 13312 boot=8/20000",  # both axes capped at the share, the guest keeps its ceiling
+                "1 2662 boot=4/10240",  # a share never rounds down to nothing
+                "4 10240 boot=4/10240",  # unset: charged what it boots at
+                "8 20000 boot=8/20000",  # a gate lease is never discounted
+            ],
+        )
+
+    def test_share_slots_register_a_waiter_at_the_share(self) -> None:
+        """A waiter holds room for what its lease will charge: the share under ceiling
+        sizing, the full size without it or at gate priority."""
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td) / "fleet.toml"  # lets `leases.py status` list waiters
+            profile.write_text("schema = 1\n[leases]\nrank_vm_waiters = true\n")
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={Path(td) / "leases"}
+                export TARTCI_FLEET_PROFILE={profile}
+                export TARTCI_HOST_CORES=16 TARTCI_HOST_MEM_MB=262144 TARTCI_ROLE=dedicated-builder
+                unset TARTCI_VM_WAITER_FRESH_SECS
+                note() {{ :; }}
+                source {HELPER}
+                tartci_profile_value() {{
+                  case "$1" in
+                    non_gate_capacity_cores) echo 14 ;;
+                    non_gate_capacity_mem_mb) echo 53248 ;;
+                    rank_vm_waiters) echo True ;;
+                    *) echo 0 ;;
+                  esac
+                }}
+                one() {{  # slots priority cores mem
+                  TARTCI_VM_LEASE_SHARE_SLOTS="$1"
+                  tartci_vm_lease_waiter_register lane-a "$3" tart-linux-vm "$2" self-hosted,linux-a64 "$4"
+                  python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
+                    python3 -c 'import json,sys; w=json.load(sys.stdin)["waiters"][0]; print(w["cores"], w["mem_mb"])'
+                  tartci_vm_lease_waiter_withdraw
+                }}
+                one 4 vm 8 20000
+                one "" vm 8 20000
+                one 4 gate 8 20000
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip().splitlines(),
+            [
+                "3 13312",  # 14 // 4 cores and 53248 // 4 MB: the share it will be charged
+                "8 20000",  # unset: the full size, as before
+                "8 20000",  # a gate waiter is never discounted
+            ],
+        )
+
+    def test_the_macos_lease_fit_probe_asks_about_the_shared_charge(self) -> None:
+        """The macOS lease-fit probe asks lease_fit.py about the share a lease would charge."""
+        with tempfile.TemporaryDirectory() as td:
+            fake_root = Path(td) / "root"
+            (fake_root / "scripts").mkdir(parents=True)
+            (fake_root / "scripts/lease_fit.py").write_text(
+                "import sys\n"
+                "args = sys.argv[1:]\n"
+                "print(args[args.index('--cores') + 1], args[args.index('--mem-mb') + 1])\n"
+            )
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                note() {{ :; }}
+                source {HELPER}
+                source {ROOT / "providers/tart-macos/lease-fit.lib.sh"}
+                TARTCI_ROOT={fake_root}
+                STATE_DIR={td} RUNNER_NAME=unit
+                tartci_vm_lease_cores() {{ echo 8; }}
+                tartci_vm_lease_mem_mb() {{ echo 20000; }}
+                tartci_lease_fit_candidate_labels() {{ echo self-hosted,macos-a64; }}
+                tartci_vm_lease_priority() {{ echo vm; }}
+                tartci_fair_share_args() {{ :; }}
+                tartci_profile_value() {{
+                  case "$1" in
+                    non_gate_capacity_cores) echo 14 ;;
+                    non_gate_capacity_mem_mb) echo 53248 ;;
+                    *) echo 0 ;;
+                  esac
+                }}
+                TARTCI_VM_LEASE_SHARE_SLOTS=4 tartci_lease_fit_probe
+                TARTCI_VM_LEASE_SHARE_SLOTS="" tartci_lease_fit_probe
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines(), ["3 13312", "8 20000"])
+
     def test_gate_lease_not_clamped(self) -> None:
         # The gate lane runs at gate priority and legitimately uses reserved cores;
         # it must NOT be clamped to the non-gate budget.

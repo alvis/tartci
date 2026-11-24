@@ -848,6 +848,19 @@ class ChildEnvTests(SchedulerHarness):
         self.assertFalse({"TARTCI_LINUX_VM_CORES", "TARTCI_LINUX_VM_MEM_MB"} & set(macos_env))
         self.assertFalse({"TARTCI_MACOS_VM_CORES", "TARTCI_MACOS_VM_MEM_MB"} & set(linux_env))
 
+    def test_every_child_charges_its_lease_a_max_jobs_share(self) -> None:
+        # The configured size is a ceiling: the lease charges 1/max_jobs of the host budget,
+        # so max_jobs alone caps concurrency, sized or not, on either OS.
+        sched = self.sched(max_jobs=6, macos_vm_cores=4)
+        sched.start("o/r", "macos-a64")
+        sched.start("o/r", "linux-a64")
+        self.assertEqual([spawned[1]["TARTCI_VM_LEASE_SHARE_SLOTS"] for spawned in self.spawned], ["6", "6"])
+
+    def test_an_inherited_share_does_not_reach_a_child(self) -> None:
+        sched = self.sched({"PATH": "/usr/bin", "TARTCI_VM_LEASE_SHARE_SLOTS": "1"}, max_jobs=3)
+        sched.start("o/r", "linux-x64")
+        self.assertEqual(self.spawned[0][1]["TARTCI_VM_LEASE_SHARE_SLOTS"], "3")
+
     def test_one_configured_axis_leaves_the_other_to_the_lane(self) -> None:
         # Memory alone: cores come from the host profile; cores alone: memory is derived from them.
         sched = self.sched(macos_vm_mem_mb=12288, linux_vm_cores=2)

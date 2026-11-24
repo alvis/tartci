@@ -946,7 +946,8 @@ def child_env(cfg: Config, root: str, lane: Lane, name: str, slot: int,
     per child (name, slot, lane id, state dir); explicit state/cache/log dirs, and a
     pool-owned fetchcontent dir on macOS, so no lane falls back to a host path
     (`$HOME/Library/Caches/Pulp/...`) that it would mount into a guest; the pool's
-    one VM key; the VM size owners.toml sets, if any (otherwise the lane sizes the VM)."""
+    one VM key; the VM size owners.toml sets, if any (otherwise the lane sizes the VM),
+    as a ceiling whose lease charges only a 1/max_jobs share of the host budget."""
     state_dir = os.path.join(root, "state", name)
     env = scrub_env(base_env)
     env.update({
@@ -964,6 +965,10 @@ def child_env(cfg: Config, root: str, lane: Lane, name: str, slot: int,
         "TARTCI_LINUX_LOGS": os.path.join(root, "logs", "linux"),
         "TARTCI_SHARED_QUEUE_CACHE": os.path.join(root, "state", "queue-discovery.json"),
         "TARTCI_GH_CLI": cfg.gh_cli,
+        # A VM's size is a ceiling, not a reservation: each lease charges a 1/max_jobs
+        # share of the host's non-gate budget, so max_jobs VMs always fit together and
+        # max_jobs alone caps concurrency (providers/common/vm-lease.lib.sh).
+        "TARTCI_VM_LEASE_SHARE_SLOTS": str(cfg.max_jobs),
     })
     env.update(cfg.vm_env(lane.os))
     if lane.os == "macos":
