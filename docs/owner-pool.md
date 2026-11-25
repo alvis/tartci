@@ -51,7 +51,9 @@ emulate a whole x64 machine.
 
 Needs an Apple Silicon Mac with tartci's prerequisites (`./tartci doctor`),
 a `gh` login in the keychain that is an admin of every repository to serve
-(repository-scope JIT registration needs admin), about 250 GB free for
+(repository-scope JIT registration needs admin) and an owner of every
+organization in `owners` (GitHub lets only organization owners create the
+organization webhook a forwarder listens on), about 250 GB free for
 the two goldens and their base images (the macOS golden is about 97 GB on
 the host, its Xcode base about 89 GB, the Linux golden about 15 GB) and,
 for push discovery, a second `gh` login that only the forwarders use

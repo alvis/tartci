@@ -77,16 +77,86 @@ git clone https://github.com/danielraffel/tartci.git && cd tartci
 ./tartci host-profile    # the CPU and memory budget tartci derived for this Mac
 ```
 
-To create a profile, follow the [profile-authoring guide](docs/profile-authoring.md)
-and its clean inline example. The public
-[`normal-local-fast.toml`](profiles/normal-local-fast.toml) profile is a fuller
-operator reference. A private fleet source can replace the checked-in
-`*-macos-fleet.toml` profiles and advertised labels used by fleet tooling;
-TartCI validates its commit and digests when installing, starting with the
-canary host.
+The quickest way to put the Mac to work is `tartci owners`. It serves every
+private repository of the GitHub organizations you name, plus the personal
+repositories you list. One LaunchAgent starts at login, learns about queued
+jobs from webhooks (nothing is polled), and boots a fresh VM per job on one of
+three labels: `macos-a64`, `linux-a64` or `linux-x64` (arm64 Linux with an x64
+runner under Rosetta). Your GitHub account must be an admin of every
+repository to serve and an owner of every organization you list: GitHub lets
+only organization owners create the organization webhook the pool listens on.
 
-To serve one GitHub Actions job from a fresh macOS VM, you need a macOS
-golden image on this host and a `gh` login that may register self-hosted
+1. **Build the goldens.** Both carry the toolset of GitHub's hosted runners.
+   They need about 250 GB free; the first macOS build also pulls an Xcode
+   base image of about 89 GB.
+
+   ```bash
+   export TART_HOME=~/.tart
+   providers/tart-macos/owners-golden.sh   # -> owners-macos
+   providers/tart-linux/owners-golden.sh   # -> owners-linux
+   ```
+
+2. **Log in the webhook forwarder.** It uses a second `gh` login in its own
+   directory, so the hook scopes never reach your main login:
+
+   ```bash
+   gh extension install cli/gh-webhook
+   GH_CONFIG_DIR=~/.config/tartci/gh-webhooks gh auth login --hostname github.com \
+     --git-protocol ssh --skip-ssh-key --web --insecure-storage \
+     --scopes admin:repo_hook,admin:org_hook
+   ```
+
+   Never run `gh auth logout`, `refresh` or `switch` with this
+   `GH_CONFIG_DIR`: `gh` may act on the keychain entry your main login uses.
+   To remove this login, delete the directory.
+
+3. **Name what to serve** in `~/.config/tartci/owners.toml`:
+
+   ```toml
+   owners = ["my-org"]                     # organizations: every private repo, including new ones
+   repos = ["my-user/app", "my-user/site"] # personal repositories, listed one by one
+   max_jobs = 4                            # jobs running at once
+   max_macos = 2                           # macOS jobs at once (Apple allows 2 macOS VMs)
+   # linux_vm_cores = 4                    # optional per-job VM ceilings
+   # linux_vm_mem_mb = 10240
+   ```
+
+   A personal account cannot go in `owners`: GitHub has no account-wide
+   webhook for a user, so list each of its repositories in `repos`. Only
+   private repositories are served, and each must have "Run workflows from
+   fork pull requests" turned off.
+
+4. **Check, install and watch.**
+
+   ```bash
+   ./tartci owners dry-run   # what would be served; starts nothing
+   ./tartci owners install   # pin this commit and load the LaunchAgent
+   ./tartci owners status    # served repositories, queued and running jobs
+   ```
+
+5. **Opt a workflow in** by its label:
+
+   ```yaml
+   jobs:
+     build:
+       runs-on: [self-hosted, linux-x64]   # or linux-a64, macos-a64
+   ```
+
+The service reads `owners.toml` only when it starts. After editing it, check it
+with `./tartci owners dry-run`, then restart the service:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.danielraffel.tartci.owners
+```
+
+A restart does not check the config first, and a config that fails to parse
+makes the service exit and retry every 30 seconds. Logs are in
+`~/Library/Logs/tartci/owners.{out,err}.log`. The
+[owner-wide runner pool guide](docs/owner-pool.md) covers each step in depth,
+the host's resource budget, security, and removal.
+
+To serve one repository from a lane you configure yourself instead, you need a
+macOS golden image on this host and a `gh` login that may register self-hosted
 runners on your repository. Point tartci at the repository, the golden and the
 labels your workflow asks for:
 
@@ -97,8 +167,15 @@ export TARTCI_MACOS_GOLDEN=my-macos-golden
 ```
 
 `--once` serves one job and exits. `--loop` keeps serving; the LaunchAgent
-templates in `launchd/` run it that way. The [runbook](docs/runbook.md) covers
-baking goldens, onboarding a host and installing the agents.
+templates in `launchd/` run it that way. To declare such lanes host by host,
+create a profile with the [profile-authoring guide](docs/profile-authoring.md)
+and its clean inline example. The public
+[`normal-local-fast.toml`](profiles/normal-local-fast.toml) profile is a fuller
+operator reference. A private fleet source can replace the checked-in
+`*-macos-fleet.toml` profiles and advertised labels used by fleet tooling;
+TartCI validates its commit and digests when installing, starting with the
+canary host. The [runbook](docs/runbook.md) covers baking goldens, onboarding
+a host and installing the agents.
 
 ## What it doesn't do
 
