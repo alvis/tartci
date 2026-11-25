@@ -236,7 +236,11 @@ class ServiceCase(unittest.TestCase):
     def install(self, rev: str = "HEAD", dry_run: bool = False, config: Optional[str] = None) -> int:
         return svc.install(self.layout, self.checkout, config or self.config, rev, dry_run, run=self.system,
                            which=self.tools.get, python="/opt/homebrew/bin/python3.12", uid=501, sleep=self.sleep,
-                           clock=lambda: self.now, log=self.lines.append, load_config=self.load_config)
+                           clock=lambda: self.now, log=self.lines.append, load_config=self.load_config,
+                           forwarder_login=self.forwarder_login)
+
+    def forwarder_login(self, config_dir: str) -> str:
+        return "gho_FakeForwarderLOGIN_Value9"
 
     def uninstall(self, purge: bool = False) -> int:
         return svc.uninstall(self.layout, purge, run=self.system, uid=501, sleep=self.sleep, clock=lambda: self.now,
@@ -463,6 +467,36 @@ class InstallTests(ServiceCase):
         self.assertEqual(self.system.calls, [])
         self.assertFalse(os.path.exists(self.layout.root))
 
+    def test_without_the_forwarder_login_install_is_refused_with_exit_code_2_before_any_change(self) -> None:
+        import owners_push  # noqa: PLC0415
+
+        seen: List[str] = []
+
+        def missing(config_dir: str) -> str:
+            seen.append(config_dir)
+            raise owners_push.PushError("cannot read the forwarder login /x/hosts.yml: No such file")
+
+        self.forwarder_login = missing  # type: ignore[assignment]
+        with self.assertRaises(svc.ServiceError) as caught:
+            self.install()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("the pool needs the forwarder login", str(caught.exception))
+        self.assertIn("/x/hosts.yml", str(caught.exception))
+        self.assertEqual(seen, ["~/.config/tartci/gh-webhooks"])
+        self.assertEqual(self.system.calls, [])
+        self.assertFalse(os.path.exists(self.layout.root))
+
+    def test_a_config_with_a_removed_polling_key_is_refused_with_exit_code_2(self) -> None:
+        for extra in ({"push": False}, {"push": True}, {"reconcile_seconds": 3600}):
+            with self.subTest(extra=extra):
+                self.CONFIG = dict(type(self).CONFIG, **extra)
+                with self.assertRaises(svc.ServiceError) as caught:
+                    self.install()
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("was removed", str(caught.exception))
+                self.assertEqual(self.system.calls, [])
+                self.assertFalse(os.path.exists(self.layout.root))
+
     def test_a_failing_gh_login_refuses_under_the_scrubbed_environment(self) -> None:
         self.system.gh_ok = False
         seen: Dict[str, Any] = {}
@@ -663,6 +697,20 @@ class UninstallTests(ServiceCase):
         self.assertIn("no tartci-owners-* process or VM is left", self.out())
         self.assertTrue(os.path.isdir(self.layout.app_dir))  # state and exports stay without --purge
         self.assertIn("--purge", self.out())
+
+    def test_uninstall_stops_forwarders_a_crashed_dispatcher_left_behind(self) -> None:
+        import owners_push  # noqa: PLC0415
+        self.install()
+        calls: List[str] = []
+
+        def stop_recorded(root: str, log: Any = None) -> List[str]:
+            calls.append(root)
+            return ["repo me/a (pid 4001)"]
+
+        with mock.patch.object(owners_push, "stop_recorded", stop_recorded):
+            self.assertEqual(self.uninstall(), 0)
+        self.assertEqual(calls, [self.layout.root])
+        self.assertIn("forwarder stopped a leftover: repo me/a (pid 4001)", self.out())
 
     def test_uninstall_when_nothing_is_installed_is_a_clean_no_op(self) -> None:
         self.assertEqual(self.uninstall(), 0)

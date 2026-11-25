@@ -22,6 +22,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import owners_dispatch as od  # noqa: E402
+import owners_push as op  # noqa: E402
 
 od.log_line = lambda message: None  # type: ignore[assignment]  # keep test output quiet
 REAL_SIGNAL = od._signal
@@ -128,7 +129,7 @@ class LaneLabelTests(unittest.TestCase):
 class ConfigTests(unittest.TestCase):
     def test_defaults_and_goldens(self) -> None:
         cfg = od.parse_config({"owners": ["alvis"], "golden": {"linux-x64": "custom"}})
-        self.assertEqual((cfg.max_jobs, cfg.max_macos, cfg.poll_seconds), (4, 2, 10))
+        self.assertEqual((cfg.max_jobs, cfg.max_macos, cfg.rotate_seconds), (4, 2, 3600))
         self.assertEqual(cfg.golden_for("macos-a64"), "owners-macos")
         self.assertEqual(cfg.golden_for("linux-a64"), "owners-linux")
         self.assertEqual(cfg.golden_for("linux-x64"), "custom")
@@ -136,18 +137,33 @@ class ConfigTests(unittest.TestCase):
     def test_rejects_bad_input(self) -> None:
         for data in ({}, {"owners": ["a b"]}, {"owners": ["x"], "repos": ["nope"]}, {"owners": ["x"], "max_jobs": 0},
                      {"owners": ["x"], "mystery": 1}, {"owners": ["x"], "golden": {"macos-x64": "g"}},
-                     {"owners": ["x"], "max_macos": 3}, {"owners": ["x"], "reconcile_seconds": 0},
-                     {"owners": ["x"], "push": "false"}, {"owners": ["x"], "push": 0}, {"owners": ["x"], "push": "yes"}):
+                     {"owners": ["x"], "max_macos": 3}):
             with self.subTest(data=data), self.assertRaises(od.ConfigError):
                 od.parse_config(data)
 
 
-    def test_push_is_parsed_strictly(self) -> None:
-        self.assertTrue(od.parse_config({"owners": ["x"]}).push)
-        self.assertTrue(od.parse_config({"owners": ["x"], "push": True}).push)
-        self.assertFalse(od.parse_config({"owners": ["x"], "push": False}).push)
-        cfg = od.parse_config({"owners": ["x"], "reconcile_seconds": 90})
-        self.assertEqual(cfg.reconcile_seconds, 90)  # kept and validated for the push layer
+    def test_removed_polling_keys_are_refused_with_the_reason(self) -> None:
+        cases = [({"push": True}, "push was removed"), ({"push": False}, "push was removed"),
+                 ({"push": "false"}, "push was removed"), ({"reconcile_seconds": 7200}, "reconcile_seconds was removed"),
+                 ({"reconcile_seconds": 0}, "reconcile_seconds was removed"), ({"poll_seconds": 10}, "poll_seconds was removed")]
+        for extra, reason in cases:
+            with self.subTest(extra=extra), self.assertRaises(od.ConfigError) as caught:
+                od.parse_config(dict({"owners": ["x"]}, **extra))
+            self.assertIn(reason, str(caught.exception))
+            self.assertIn("Delete the line", str(caught.exception))
+        with self.assertRaises(od.ConfigError) as caught:
+            od.parse_config({"owners": ["x"], "push": True, "reconcile_seconds": 900})
+        self.assertIn("push was removed", str(caught.exception))
+        self.assertIn("reconcile_seconds was removed", str(caught.exception))
+
+    def test_a_removed_key_exits_2_before_any_github_call(self) -> None:
+        for extra in ({"push": False}, {"push": True}, {"reconcile_seconds": 3600}):
+            with self.subTest(extra=extra), \
+                    mock.patch.object(od, "load_config", side_effect=lambda path, e=extra: od.parse_config(
+                        dict({"owners": ["x"]}, **e))), \
+                    mock.patch.object(od, "check_gh_auth") as auth, mock.patch("sys.stderr"):
+                self.assertEqual(od.main(["--root", "/nonexistent-owners-root", "dry-run"]), 2)
+                auth.assert_not_called()
 
     def test_vm_sizes_are_optional_and_validated(self) -> None:
         cfg = od.parse_config({"owners": ["x"]})
@@ -203,24 +219,33 @@ class ConfigTests(unittest.TestCase):
 
 class DirectoryTests(unittest.TestCase):
     def directory(self, routes: Dict[str, Any], **cfg: Any) -> od.Directory:
-        base: Dict[str, Any] = {"owners": ["org1", "me"]}
+        base: Dict[str, Any] = {"owners": ["org1"]}
         base.update(cfg)
-        routes.setdefault("user", {"login": "me"})
         routes.setdefault("users/org1", {"type": "Organization"})
-        routes.setdefault("users/me", {"type": "User"})
         return od.Directory(FakeGh(routes), od.parse_config(base))
 
-    def test_lists_private_repos_of_orgs_and_users_and_extras(self) -> None:
+    def test_lists_private_repos_of_orgs_and_extras(self) -> None:
         routes: Dict[str, Any] = {
             "orgs/org1/repos?type=private": [repo_json("org1/a"), repo_json("org1/arch", archived=True)],
-            "user/repos?affiliation=owner&visibility=private": [repo_json("me/b"), repo_json("collab/x")],
+            "repos/me/b": repo_json("me/b"),
             "repos/other/extra": repo_json("other/extra"),
         }
         for full in ("org1/a", "me/b", "other/extra"):
             routes[fork_route(full)] = FORK_OFF
-        found = self.directory(routes, repos=["other/extra"]).refresh()
+        found = self.directory(routes, repos=["other/extra", "me/b"]).refresh()
         self.assertEqual(sorted(found.served), ["me/b", "org1/a", "other/extra"])
         self.assertEqual(found.refused, {"org1/arch": "archived"})
+
+    def test_a_personal_owner_is_never_listed(self) -> None:
+        # Its repositories are served through `repos` (one forwarder each), never by listing the account.
+        routes: Dict[str, Any] = {"users/me": {"type": "User"}, "user": {"login": "me"},
+                                  "user/repos?affiliation=owner&visibility=private": [repo_json("me/a")],
+                                  fork_route("me/a"): FORK_OFF}
+        directory = self.directory(routes, owners=["me"])
+        found = directory.refresh()
+        self.assertEqual(found.served, {})
+        self.assertIn("personal account", found.errors["me"])
+        self.assertNotIn("user/repos?affiliation=owner&visibility=private", directory.client.calls)
 
     def test_public_internal_and_non_admin_never_served(self) -> None:
         routes: Dict[str, Any] = {
@@ -231,7 +256,6 @@ class DirectoryTests(unittest.TestCase):
                 repo_json("org1/forkson"),
                 repo_json("org1/ok"),
             ],
-            "user/repos?affiliation=owner&visibility=private": [],
             fork_route("org1/forkson"): {"run_workflows_from_fork_pull_requests": True},
             fork_route("org1/ok"): FORK_OFF,
         }
@@ -245,7 +269,6 @@ class DirectoryTests(unittest.TestCase):
     def test_explicit_public_repo_is_refused_and_exclusions_apply(self) -> None:
         routes: Dict[str, Any] = {
             "orgs/org1/repos?type=private": [repo_json("org1/a"), repo_json("org1/skip")],
-            "user/repos?affiliation=owner&visibility=private": [],
             "repos/o/pub": repo_json("o/pub", visibility="public", private=False),
             fork_route("org1/a"): FORK_OFF,
         }
@@ -257,7 +280,6 @@ class DirectoryTests(unittest.TestCase):
     def test_listing_failure_keeps_previous_repos_and_reports_error(self) -> None:
         routes: Dict[str, Any] = {
             "orgs/org1/repos?type=private": [repo_json("org1/a")],
-            "user/repos?affiliation=owner&visibility=private": [],
             fork_route("org1/a"): FORK_OFF,
         }
         directory = self.directory(routes, owners=["org1"])
@@ -270,7 +292,6 @@ class DirectoryTests(unittest.TestCase):
     def test_transient_fork_setting_failure_keeps_a_served_repo_but_404_refuses(self) -> None:
         routes: Dict[str, Any] = {
             "orgs/org1/repos?type=private": [repo_json("org1/a")],
-            "user/repos?affiliation=owner&visibility=private": [],
             fork_route("org1/a"): FORK_OFF,
         }
         directory = self.directory(routes, owners=["org1"])
@@ -460,16 +481,6 @@ class ScannerTests(unittest.TestCase):
 
 
 class RateTests(unittest.TestCase):
-    def test_interval_widens_then_waits_for_reset(self) -> None:
-        self.assertEqual(od.adaptive_interval(10, od.RateState(), 0)[0], 10)
-        self.assertEqual(od.adaptive_interval(10, od.RateState(4000, 5000, 100.0), 0)[0], 10)
-        widened, note = od.adaptive_interval(10, od.RateState(500, 5000, 100.0), 0)
-        self.assertGreater(widened, 10)
-        self.assertIn("widened", note)
-        waiting, note = od.adaptive_interval(10, od.RateState(40, 5000, 160.0), 100.0)
-        self.assertEqual(waiting, 60.0)
-        self.assertIn("reset", note)
-
     def test_parse_gh_i_and_rate_headers(self) -> None:
         text = ("HTTP/2.0 200 OK\r\nX-Ratelimit-Remaining: 4873\r\nX-Ratelimit-Limit: 5000\r\n"
                 "X-Ratelimit-Reset: 1795366219\r\nEtag: W/\"abc\"\r\n\r\n{\"ok\": true}")
@@ -576,6 +587,33 @@ def fake_started(pid: Any) -> str:
     return f"T{pid}"
 
 
+class FakePush:
+    """The dispatcher's view of a Supervisor."""
+
+    def __init__(self, targets: List[op.Target]) -> None:
+        self.targets = targets
+        self.pending = op.PushSignals()
+        self.catchups: List[Tuple[str, float]] = []
+        self.shut = False
+
+    def poll(self) -> op.PushSignals:
+        signals, self.pending = self.pending, op.PushSignals()
+        return signals
+
+    def covering(self, full: str) -> Optional[op.Target]:
+        return next((t for t in self.targets if t.covers(full)), None)
+
+    def note_catchup(self, target: op.Target, when: float) -> None:
+        self.catchups.append((target.key, when))
+
+    def shutdown(self) -> None:
+        self.shut = True
+
+    def summary(self) -> Dict[str, Any]:
+        return {"receiver": "127.0.0.1:1", "mode": "gh-webhook", "forwarders": [], "hook_api_requests": 0}
+
+
+
 class SchedulerHarness(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -627,7 +665,7 @@ class SchedulerHarness(unittest.TestCase):
         return od.Dispatcher(config, self.root, "/opt/tartci", client, sched, od.Scanner(client),
                              od.Directory(client, config), clock=lambda: self.now, sleep=self.fake_sleep,
                              tart=tart or (lambda argv: "[]"), alive=alive or (lambda pid, started="": False),
-                             born=lambda vm: None)
+                             born=lambda vm: None, push=FakePush(op.targets_for(config)))
 
     def launch(self, sched: od.Scheduler, jobs: List[od.QueuedJob]) -> List[od.Child]:
         return [sched.start(repo, lane) for repo, lane in sched.plan(jobs, self.now)]
@@ -1667,8 +1705,10 @@ class DispatcherTests(SchedulerHarness):
         disp.scan_cycle()
         self.assertEqual(len(disp.sched.children), 1)
         routes["repos/org1/a"] = od.GhError("network down")
+        routes["rate_limit"] = od.GhError("network down")  # the confirmation fails too
         self.now += 100
         disp.scan_cycle()
+        self.assertIsNotNone(disp.error_since)
         self.assertIsNone(disp.exit_code)  # failing, not yet "sustained"
         self.now += od.SUSTAINED_FAILURE_SECONDS
         disp.scan_cycle()
@@ -1686,19 +1726,25 @@ class DispatcherTests(SchedulerHarness):
         routes["repos/org1/a"] = od.GhError("HTTP 403: secondary rate limit", status=403,
                                             rate_limited=True, retry_after=600.0)
         for _ in range(6):  # 1 hour of being rate limited: far beyond the 3-minute unreachable rule
-            self.now = disp.next_scan
+            self.now = max(self.now, disp.rate_block_until)
             disp.scan_cycle()
-            self.assertGreaterEqual(disp.next_scan - self.now, 600.0)  # not "next scan in 10 s"
+            self.assertGreaterEqual(disp.rate_block_until - self.now, 600.0)
             self.assertIsNone(disp.error_since)
             self.assertIsNone(disp.exit_code)
             self.assertFalse(disp.sched.stopping)
-        # A push hint cannot bypass the wait.
-        disp.request_scan("org1/a")
-        self.assertFalse(disp._scan_due())
+        self.assertIn("GitHub asked us to wait", disp.snapshot()["rate"]["note"])
+        # A hint cannot bypass the wait; it is kept and served once the wait is over.
+        disp.push.pending.events.append(op.Event("org-org1", "workflow_job", action="queued", repo="org1/a",
+                                                 labels=("self-hosted", "linux-a64")))
+        before = len(disp.client.calls)
+        self.now += 1
+        disp.push_tick()
+        self.assertEqual(len(disp.client.calls), before)
         self.now = disp.rate_block_until
-        self.assertTrue(disp._scan_due())
+        disp.push_tick()
+        self.assertIn("repos/org1/a", disp.client.calls[before:])
 
-    def test_largest_wait_of_the_cycle_wins_and_other_failures_still_count(self) -> None:
+    def test_largest_wait_of_the_cycle_wins_and_only_unanswered_failures_count(self) -> None:
         routes: Dict[str, Any] = {"orgs/org1/repos?type=private": [repo_json("org1/a"), repo_json("org1/b")],
                                   fork_route("org1/b"): FORK_OFF}
         routes.update(scan_routes("org1/a", [], {}))
@@ -1707,30 +1753,19 @@ class DispatcherTests(SchedulerHarness):
         routes["repos/org1/a"] = od.GhError("429", status=429, rate_limited=True, retry_after=120.0)
         routes["repos/org1/b"] = od.GhError("403", status=403, rate_limited=True, retry_after=900.0)
         disp.scan_cycle()
-        self.assertEqual(disp.next_scan - self.now, 900.0)
+        self.assertEqual(disp.rate_block_until - self.now, 900.0)
         self.assertIsNone(disp.error_since)
-        # One repo rate limited, the other genuinely failing: nothing was readable, so it counts.
+        routes["rate_limit"] = od.GhError("connection reset")
+        # One repository rate limited (GitHub answered), the other failing: no outage.
         routes["repos/org1/b"] = od.GhError("connection reset")
-        self.now = disp.next_scan
-        disp.scan_cycle()
+        self.now = disp.rate_block_until
+        disp.scan_cycle(discover=False)
+        self.assertIsNone(disp.error_since)
+        # Both unanswered and `GET rate_limit` failing too: it counts.
+        routes["repos/org1/a"] = od.GhError("connection reset")
+        self.now = disp.rate_block_until + 1
+        disp.scan_cycle(discover=False)
         self.assertIsNotNone(disp.error_since)
-
-    def test_rate_headroom_widens_the_next_scan(self) -> None:
-        routes = scan_routes("org1/a", [], {})
-        disp = self.dispatcher(routes)
-        disp.client.rate = od.RateState(300, 5000, self.now + 1000)
-        disp.scan_cycle()
-        self.assertGreater(disp.next_scan - self.now, disp.cfg.poll_seconds)
-
-    def test_rate_headers_from_the_client_widen_the_interval(self) -> None:
-        routes = scan_routes("org1/a", [], {})
-        disp = self.dispatcher(routes)
-        disp.client.default_headers = {"X-Ratelimit-Remaining": "300", "X-Ratelimit-Limit": "5000",
-                                       "X-Ratelimit-Reset": str(int(self.now) + 1000)}
-        disp.scan_cycle()
-        self.assertEqual(disp.client.rate.remaining, 300)
-        self.assertGreater(disp.next_scan - self.now, disp.cfg.poll_seconds)
-        self.assertIn("widened", disp.interval_note)
 
     def test_spawn_failure_does_not_stop_the_cycle_and_backs_the_pair_off(self) -> None:
         routes = self.queued_a(10)
@@ -2056,7 +2091,13 @@ class RunLoopTests(SchedulerHarness):
                 raise AssertionError("run() did not return")
 
         disp.sleep = sleep
+        disp.push.pending.established.extend(disp.push.targets)  # the forwarders come up: their catch-up
         return disp
+
+    @staticmethod
+    def event(disp: od.Dispatcher, repo: str = "org1/a", action: str = "in_progress") -> None:
+        disp.push.pending.events.append(op.Event("org-org1", "workflow_job", action=action, repo=repo,
+                                                 labels=("self-hosted", "linux-a64")))
 
     def test_sigterm_during_a_scan_starts_no_children_and_shuts_down(self) -> None:
         routes = scan_routes("org1/a", [run_json(1, "org1/a")], {1: [job_json(10, ["linux-a64"])]})
@@ -2124,6 +2165,7 @@ class RunLoopTests(SchedulerHarness):
 
         def break_scans() -> None:
             broken["on"] = True
+            self.event(disp)  # its job's next event: the guard scans the repository, and that raises
 
         def children_finish() -> None:
             for _, _, _, proc in self.spawned:
@@ -2143,6 +2185,8 @@ class RunLoopTests(SchedulerHarness):
 
         def github_down() -> None:
             routes["repos/org1/a"] = od.GhError("network down")
+            routes["rate_limit"] = od.GhError("network down")
+            self.event(disp)  # its job's next event: the scan fails, and is retried on the ladder
 
         def child_finishes() -> None:
             for _, _, _, proc in self.spawned:
@@ -2431,13 +2475,19 @@ class GhEnvTests(unittest.TestCase):
             captured["auth_env"] = env
             return "`gh auth status` failed without GH_TOKEN/GITHUB_TOKEN (rc=1): not logged in"
 
+        push = mock.Mock(forwarders={}, binary=None)
+        push.receiver.port = 1
         with tempfile.TemporaryDirectory() as root, mock.patch.dict(os.environ, self.TOKENS), \
                 mock.patch.object(od, "load_config", return_value=od.parse_config({"owners": ["o"]})), \
                 mock.patch.object(od, "GhClient", fake_client), mock.patch.object(od, "Dispatcher", StubDispatcher), \
                 mock.patch.object(od, "check_gh_auth", fake_auth), mock.patch.object(od.signal, "signal"), \
-                mock.patch.object(od, "log_line", logged.append):
+                mock.patch.object(od, "log_line", logged.append), \
+                mock.patch.object(op, "read_forwarder_token", return_value="not-a-token"), \
+                mock.patch.object(op, "check_owner_types", return_value={}), \
+                mock.patch.object(op, "stop_recorded"), mock.patch.object(op, "build", return_value=push):
             code = od.cmd_run(mock.Mock(config="x", root=os.path.join(root, "owners")))
         self.assertEqual(code, 0)
+        push.shutdown.assert_called_once_with()
         for key in ("client_env", "auth_env"):
             self.assertFalse(set(self.TOKENS) & set(captured[key]), key)
             self.assertIn("HOME", captured[key])
@@ -2453,7 +2503,9 @@ class GhEnvTests(unittest.TestCase):
         with mock.patch.dict(os.environ, self.TOKENS), \
                 mock.patch.object(od, "load_config", return_value=od.parse_config({"owners": ["o"]})), \
                 mock.patch.object(od, "GhClient", fake_client), mock.patch.object(od, "check_gh_auth", return_value=None), \
-                mock.patch("builtins.print"):
+                mock.patch.object(op, "read_forwarder_token", return_value="not-a-token"), \
+                mock.patch.object(op, "check_owner_types", return_value={}), \
+                mock.patch.object(op, "forwarder_binary", return_value=None), mock.patch("builtins.print"):
             od.cmd_dry_run(mock.Mock(config="x", scans=1, json=False))
         self.assertFalse(set(self.TOKENS) & set(captured["env"]))
 

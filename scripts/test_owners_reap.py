@@ -272,6 +272,8 @@ class DispatcherReapTickTests(ReapHarness):
         disp.reaper = self.reaper()
         disp.directory.current.served = {name: None for name in REPOS}  # type: ignore[misc]
         self.now += 10_000
+        # a child ended badly in each: only such repositories are visited
+        disp._reap_candidates.update({name: self.now for name in REPOS})
         return disp
 
     def assert_blocked(self, disp: od.Dispatcher, why: str) -> None:

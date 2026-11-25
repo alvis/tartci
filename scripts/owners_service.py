@@ -398,7 +398,8 @@ def install(layout: Layout, checkout: str, config_path: str, rev: str, dry_run: 
             python: Optional[str] = None, uid: Optional[int] = None,
             sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.time,
             log: Callable[[str], None] = _log,
-            load_config: Callable[[str], Any] = od.load_config) -> int:
+            load_config: Callable[[str], Any] = od.load_config,
+            forwarder_login: Optional[Callable[[str], Any]] = None) -> int:
     uid = os.getuid() if uid is None else uid
     if uid == 0:
         raise ServiceError("run `tartci owners install` as the user that owns the pool, not as root")
@@ -408,6 +409,14 @@ def install(layout: Layout, checkout: str, config_path: str, rev: str, dry_run: 
         cfg = load_config(config)
     except od.ConfigError as error:
         raise ServiceError(f"refusing to install: {error}", code=2)
+    # `run` exits 2 without it, and KeepAlive would restart it every ThrottleInterval for ever.
+    import owners_push  # noqa: PLC0415
+
+    try:
+        (forwarder_login or owners_push.read_forwarder_token)(cfg.forwarder_gh_config_dir)
+    except owners_push.PushError as error:
+        raise ServiceError(f"refusing to install: the pool needs the forwarder login ({error}). Log it in "
+                           "as step 3 of docs/owner-pool.md (\"The forwarder login\") shows", code=2)
     if not os.path.lexists(os.path.join(checkout, ".git")):
         raise ServiceError(f"{checkout} is not a git checkout: install from the checkout, which is what it exports")
     dirs = path_dirs(cfg.gh_cli, which)
@@ -608,6 +617,12 @@ def uninstall(layout: Layout, do_purge: bool, *, run: Runner = subprocess.run, u
         raise ServiceError(f"{LABEL} is still loaded after {UNLOAD_WAIT_SECONDS:.0f} s; its plist is left in place. "
                            f"See `launchctl print {launchd.target}`")
     log(f"launchd  {LABEL}: {'booted out' if was_loaded else 'was not loaded'}")
+    # The dispatcher stops its forwarders on SIGTERM; one it could not (launchd's 60 s cap, a crash) is
+    # stopped here, by its recorded pid AND start time, so no hook outlives the pool.
+    import owners_push  # noqa: PLC0415
+
+    for entry in owners_push.stop_recorded(layout.root, log=log):
+        log(f"forwarder stopped a leftover: {entry}")
     if os.path.lexists(layout.plist):
         os.unlink(layout.plist)
         log(f"plist    removed {layout.plist}")
