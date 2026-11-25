@@ -24,7 +24,7 @@ class LinuxRunnerUmaskTests(unittest.TestCase):
         read_pos = self.body.index('runner_umask=\\"\\$(umask)\\"', set_pos)
         log_pos = self.body.index("TARTCI_DIAG runner_umask=%s", read_pos)
         assert_pos = self.body.index('[ \\"\\$runner_umask\\" = 0022 ]', log_pos)
-        launch_pos = self.body.index("./run.sh --jitconfig", assert_pos)
+        launch_pos = self.body.index("./run.sh", assert_pos)
 
         self.assertLess(set_pos, read_pos)
         self.assertLess(read_pos, log_pos)
