@@ -67,6 +67,8 @@ tartci_lease_fit_probe(){
   ngc="$(tartci_profile_value non_gate_capacity_cores 2>/dev/null)" || ngc=""
   ! tartci_positive_int_or_empty "$ngc" || cap_args=(--non-gate-cap "$ngc")
   tartci_positive_int_or_empty "$mem" || mem="$(tartci_vm_lease_derived_mem_mb "$cores")"
+  # Ceiling sizing (the owners pool) charges a share; ask about that charge.
+  read -r cores mem <<<"$(tartci_vm_lease_share_charge "$cores" "$mem" vm)"
   # Fair share: a starved lane is asked about at gate priority, and a lane that
   # would displace another repository's starved lane answers `yield` (5).
   while IFS= read -r fair_arg; do

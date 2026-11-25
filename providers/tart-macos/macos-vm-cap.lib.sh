@@ -30,8 +30,9 @@ tartci_effective_cap(){
 
 # A process's start time with the spaces removed ("Mon Nov  3 10:00:00 2026" →
 # "MonNov310:00:002026"), or empty when the process is gone. Paired with the pid
-# it identifies a process across pid reuse.
-tartci_pid_token(){ ps -o lstart= -p "$1" 2>/dev/null | tr -d ' \t'; }
+# it identifies a process across pid reuse. Rendered in the C locale with no TZ, so a
+# token written by a launchd lane matches one read from a shell with another locale.
+tartci_pid_token(){ env -u TZ LC_ALL=C LANG=C ps -o lstart= -p "$1" 2>/dev/null | tr -d ' \t'; }
 
 # Count live reservations = macOS slots claimed by in-flight boots/jobs. Each
 # reservation file holds "<owner-supervisor-pid> <start-token> <epoch>" (an older

@@ -677,5 +677,23 @@ class LiveReservationsPidReuseTests(unittest.TestCase):
             self.assertEqual(gate_supply.live_reservations(d, now), 2)
 
 
+class PidTokenLocaleTests(unittest.TestCase):
+    """A reservation token reads the same as macos-vm-cap.lib.sh writes it, whatever
+    locale or zone the reader runs under (the lib renders under LC_ALL=C, no TZ)."""
+
+    def test_token_matches_the_cap_lib_under_any_locale(self) -> None:
+        lib = ROOT / "providers" / "tart-macos" / "macos-vm-cap.lib.sh"
+        proc = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        written = subprocess.run(["bash", "-c", f'source "{lib}"; tartci_pid_token {proc.pid}'],
+                                 capture_output=True, text=True, check=True).stdout.strip()
+        self.assertTrue(written)
+        for extra in ({"LANG": "en_GB.UTF-8", "LC_ALL": "en_GB.UTF-8"},
+                      {"LANG": "de_DE.UTF-8", "LC_TIME": "de_DE.UTF-8", "TZ": "Asia/Tokyo"}):
+            with self.subTest(env=extra), mock.patch.dict(os.environ, extra):
+                self.assertEqual(gate_supply._pid_token(proc.pid), written)
+
+
 if __name__ == "__main__":
     unittest.main()
