@@ -1182,3 +1182,30 @@ not permission to force-remove a worktree.
   → *Diagnose:*
   the lane's `queue-scan.<hash>.json` `negative` map lists only runs that scan
   evaluated; the merge-group run's id is absent while its job sits `queued`.
+
+## The owner-pool LaunchAgent boots VMs it cannot reach (2026-11-22)
+
+- **`tartci owners install` loads fine and the dispatcher polls, but every child ends
+  `no SSH on <vm> after 180s` / `no SSH after 179s (80 attempts…)` with rc=1 and
+  `never assigned`, while `tart ip <vm>` answers and `ssh` from a shell reaches the same
+  VM.** → *Cause:* macOS Local Network privacy. Under launchd a process's network access is
+  attributed to its responsible process, the job's main process; Homebrew's `python3.x`
+  re-execs into `Python.app`, a bundled app executable, so the dispatcher's children inherited
+  an identity that may not talk to `192.168.64.x`, and no prompt can ever be answered for a
+  background job. `ssh` fails at once with `No route to host`. A shell, `bash`, or a bare
+  `caffeinate` job is not affected, and neither is a run from a terminal (the terminal app is
+  the responsible process). Measured with a launchd probe job: Python.app spawning `ssh` plainly
+  → rc 255 `No route to host`; a bash parent between launchd and Python.app → the same (the
+  bundled executable itself is what counts); `posix_spawn` with the responsibility disclaimed →
+  rc 0. → *Fix:* `spawn_process` (scripts/owners_dispatch.py) starts every pool child with
+  `responsibility_spawnattrs_setdisclaim`, so the child (bash, ssh, tart: platform tools) is its
+  own responsible process; session, 0600 log, stdin, env, signals and fds are as with `Popen`
+  (tests: scripts/test_owners_spawn.py). It falls back to `Popen` when the symbol is absent.
+  → *Diagnose:* run `ssh -n -o BatchMode=yes -i ~/.config/tartci/owners-vm-ed25519
+  admin@<tart ip>` as a throwaway launchd job whose program is the same Python (a
+  `ProgramArguments` of `python3 -c "import subprocess; print(subprocess.run([...]).returncode)"`).
+- **launchd caps `ExitTimeOut` at 60 s for a user agent** (`launchctl print` shows
+  `exit timeout = 60`; a SIGTERM-ignoring job that asked for 210 s was SIGKILLed after 61 s on
+  macOS 27). The dispatcher's 150 s child grace therefore cannot always finish under launchd:
+  its children have been sent SIGTERM at t=0 and finish in their own sessions, and
+  `tartci owners uninstall` waits up to 150 s more for them before it reports leftovers.

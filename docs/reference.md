@@ -322,15 +322,19 @@ Pair it with an x64 label (`--labels self-hosted,linux-x64`). The Rosetta
 runtime must be installed on the host (Apple removes most of Rosetta 2 in
 macOS 28). `providers/tart-linux/owners-golden.sh` builds a project-neutral
 golden (`owners-linux`) for both lanes: the pinned Ubuntu base, both runners
-(sha256-verified), the amd64 libraries the x64 runner needs, a boot-time unit
-that mounts Rosetta and registers binfmt only when the share is attached, and
-the baseline tools a GitHub-hosted job expects, including Node.js LTS with
-`npm` and `npx` in `/usr/local/bin` (sha256-verified; `pnpm/setup`'s
-`runtime: node@...` installs node without npm). That Node is arm64 on both
-lanes: on `linux-x64` the runner runs under Rosetta, but a job's `node` and
-`npm` run natively. A Linux golden also needs user `admin` with passwordless
+(sha256-verified), the amd64 runtime libraries x64 binaries need, a boot-time
+unit that mounts Rosetta and registers binfmt only when the share is attached,
+and the toolset of GitHub's hosted Ubuntu image wherever it has an arm64 build
+(Docker, cloud CLIs, JDKs, language toolchains, ...; every direct download
+sha256-verified, every third-party apt key fingerprint-pinned; the list is in
+docs/owner-pool.md, "Golden toolset"), with GitHub's runner environment
+(`ImageOS`, `RUNNER_TOOL_CACHE=/opt/hostedtoolcache`, `JAVA_HOME_<v>_X64`).
+Those tools are arm64 on both lanes: on `linux-x64` the runner runs under
+Rosetta, but a job's `node`, `docker` or `java` run natively, and the x64
+runner's containers default to `linux/amd64`. A Linux golden also needs user `admin` with passwordless
 sudo and the public half of `TARTCI_VM_SSH_KEY` in its `authorized_keys`: the
-lane connects with key authentication only.
+lane connects with key authentication only, and `owners-golden.sh` finishes by
+making the guest's sshd refuse password login.
 The macOS JIT runner also enforces a bounded warm-cache capacity through
 `TARTCI_CCACHE_MAX_SIZE` (default `40G`) in the Actions runner environment, so
 each disposable VM shares compiler objects without falling back to ccache's
